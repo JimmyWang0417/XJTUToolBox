@@ -17,33 +17,8 @@ from .config import cfg
 from .migrate_data import DATA_DIRECTORY
 
 # Linux Keyring 崩溃保护层
-if sys.platform.startswith("linux"):
-    _orig_get_password = keyring.core.get_password
-    _orig_set_password = keyring.core.set_password
-    _orig_delete_password = keyring.core.delete_password
-    
-    def _linux_safe_get_password(*args, **kwargs):
-        try:
-            return _orig_get_password(*args, **kwargs)
-        except Exception as e:
-            print(f"Warning: Linux keyring get unavailable. {e}")
-            return None
-            
-    def _linux_safe_set_password(*args, **kwargs):
-        try:
-            return _orig_set_password(*args, **kwargs)
-        except Exception as e:
-            print(f"Warning: Linux keyring set unavailable. {e}")
-            
-    def _linux_safe_delete_password(*args, **kwargs):
-        try:
-            return _orig_delete_password(*args, **kwargs)
-        except Exception as e:
-            print(f"Warning: Linux keyring delete unavailable. {e}")
-
-    keyring.core.get_password = keyring.get_password = _linux_safe_get_password
-    keyring.core.set_password = keyring.set_password = _linux_safe_set_password
-    keyring.core.delete_password = keyring.delete_password = _linux_safe_delete_password
+from .linux_compat import apply_linux_keyring_patches
+apply_linux_keyring_patches()
 
 def pad(text):
     text_length = len(text)
