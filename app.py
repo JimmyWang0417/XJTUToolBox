@@ -18,12 +18,12 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 with contextlib.redirect_stdout(None):
     from app.main_window import MainWindow, MacReopenFilter
     from app.utils import cfg
+    from app.utils.single_app import SingleApplication
 
 QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
 QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
 
-from app.utils.single_app import SingleApplication
 if __name__ == '__main__':
     APP_ID = "XJTUToolBox_SingleInstance_Lock"
 
