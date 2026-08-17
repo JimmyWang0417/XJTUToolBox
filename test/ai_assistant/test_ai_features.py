@@ -1,4 +1,5 @@
 import json
+import requests
 import sqlite3
 import tempfile
 import threading
@@ -18,7 +19,9 @@ from ai_assistant.web_search import (
     DUCKDUCKGO_ENDPOINT,
     SEARCH_ENGINES,
     SearchHumanVerificationRequired,
+    SearchResult,
     WebSearchClient,
+    _normalize_results,
     validate_search_settings,
 )
 from ai_assistant import ChatMessage
@@ -29,7 +32,15 @@ FIXTURE_DIR = Path(__file__).with_name("fixtures")
 
 
 class FakeResponse:
-    def __init__(self, payload=None, *, status=200, text="", url="https://example.test/"):
+    def __init__(
+        self,
+        payload=None,
+        *,
+        status=200,
+        text="",
+        url="https://example.test/",
+        headers=None,
+    ):
         self.payload = payload
         self.status_code = status
         self.text = text
@@ -37,6 +48,7 @@ class FakeResponse:
         self.url = url
         self.closed = False
         self.encoding = "utf-8"
+        self.headers = dict(headers or {})
 
     def json(self):
         if isinstance(self.payload, Exception):
@@ -55,19 +67,27 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, get_response=None, post_response=None):
+    def __init__(self, get_response=None, post_response=None, head_response=None):
         self.get_response = get_response
         self.post_response = post_response
+        self.head_response = head_response
         self.calls = []
 
-    def get(self, url, **kwargs):
-        self.calls.append(("GET", url, kwargs))
-        response = self.get_response
+    @staticmethod
+    def _next(response):
         if isinstance(response, list):
             response = response.pop(0)
         if isinstance(response, Exception):
             raise response
         return response
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self._next(self.get_response)
+
+    def head(self, url, **kwargs):
+        self.calls.append(("HEAD", url, kwargs))
+        return self._next(self.head_response)
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
@@ -280,8 +300,6 @@ class WebSearchTest(unittest.TestCase):
             )
 
     def test_timeout_redirect_and_oversized_stream_are_safe(self):
-        import requests
-
         with self.assertRaisesRegex(RuntimeError, "超时"):
             WebSearchClient(FakeSession(get_response=requests.Timeout())).search(
                 "x", engine="searxng", endpoint="https://search.example"
@@ -298,6 +316,59 @@ class WebSearchTest(unittest.TestCase):
                 "x", engine="searxng", endpoint="https://search.example"
             )
         self.assertTrue(oversized.closed)
+
+    def test_result_filter_rejects_unsafe_duplicates_and_empty_titles(self):
+        rows = [
+            ("ok", "https://source.test/a", "one"),
+            ("duplicate", "https://source.test/a", "two"),
+            ("", "https://source.test/b", "empty"),
+            ("bad", "https://user:secret@source.test/c", "credentials"),
+            ("bad", "http:///missing-host", "host"),
+            ("bad", "javascript:alert(1)", "scheme"),
+        ]
+        self.assertEqual(
+            _normalize_results(rows),
+            [SearchResult("ok", "https://source.test/a", "one")],
+        )
+
+    def test_bing_and_duckduckgo_distinguish_empty_from_unknown_structure(self):
+        explicit_empty = (
+            (
+                "bing",
+                BING_ENDPOINT,
+                '<html><ol id="b_results"><li class="b_no">没有与此相关的结果</li></ol></html>',
+            ),
+            (
+                "duckduckgo",
+                DUCKDUCKGO_ENDPOINT,
+                '<html><div class="no-results">No results.</div></html>',
+            ),
+        )
+        for engine, endpoint, content in explicit_empty:
+            with self.subTest(engine=engine):
+                response = FakeResponse(text=content, url=endpoint)
+                self.assertEqual(
+                    WebSearchClient(FakeSession(get_response=response)).search(
+                        "x", engine=engine
+                    ),
+                    [],
+                )
+                self.assertTrue(response.closed)
+
+        for engine, endpoint in (
+            ("bing", BING_ENDPOINT),
+            ("duckduckgo", DUCKDUCKGO_ENDPOINT),
+        ):
+            with self.subTest(engine=f"{engine}-unknown"):
+                response = FakeResponse(
+                    text="<html><body>changed layout</body></html>",
+                    url=endpoint,
+                )
+                with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
+                    WebSearchClient(FakeSession(get_response=response)).search(
+                        "x", engine=engine
+                    )
+                self.assertTrue(response.closed)
 
     def test_duckduckgo_human_challenge_is_not_misreported_as_empty_results(self):
         challenged = FakeResponse(
@@ -422,8 +493,6 @@ class WebSearchTest(unittest.TestCase):
                 bing_challenge,
                 duckduckgo_challenge,
             ])).search("x", engine="auto", limit=3)
-
-        import requests
 
         with self.assertRaisesRegex(RuntimeError, "内置联网搜索暂时不可用"):
             WebSearchClient(FakeSession(get_response=[

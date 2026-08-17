@@ -48,6 +48,10 @@ class SearchHumanVerificationRequired(RuntimeError):
     """The public search endpoint returned a CAPTCHA/challenge page."""
 
 
+class SearchAllSourcesVerificationRequired(SearchHumanVerificationRequired):
+    """Every source in automatic mode returned a CAPTCHA/challenge page."""
+
+
 @dataclass(frozen=True)
 class SearchResult:
     title: str
@@ -205,14 +209,9 @@ class WebSearchClient:
 
     @staticmethod
     def _parse_duckduckgo(content: str) -> list[SearchResult]:
-        try:
-            document = html.fromstring(content)
-        except (TypeError, ValueError) as error:
-            raise RuntimeError("DuckDuckGo 返回了无法解析的页面") from error
+        document = _parse_html(content, "DuckDuckGo")
         if document.xpath("//*[@id='challenge-form' or contains(@class, 'anomaly-modal')]"):
-            raise SearchHumanVerificationRequired(
-                "DuckDuckGo 要求人机验证；已自动关闭联网搜索"
-            )
+            raise SearchHumanVerificationRequired("DuckDuckGo 要求人机验证")
         rows = []
         for result in document.xpath(
             "//*[contains(concat(' ', normalize-space(@class), ' '), ' result ')]"
@@ -233,14 +232,19 @@ class WebSearchClient:
             )
             snippet = " ".join(snippet_nodes[0].text_content().split()) if snippet_nodes else ""
             rows.append((" ".join(link.text_content().split()), href, snippet))
-        return _normalize_results(rows)
+        return _require_results_or_empty(
+            document,
+            _normalize_results(rows),
+            no_result_xpath=(
+                "//*[contains(concat(' ', normalize-space(@class), ' '), ' no-results ') "
+                "or contains(concat(' ', normalize-space(@class), ' '), ' results--no-results ')]"
+            ),
+            engine_name="DuckDuckGo",
+        )
 
     @staticmethod
     def _parse_bing(content: str) -> list[SearchResult]:
-        try:
-            document = html.fromstring(content)
-        except (TypeError, ValueError) as error:
-            raise RuntimeError("Bing 返回了无法解析的页面") from error
+        document = _parse_html(content, "Bing")
         if document.xpath(
             "//*[@id='b_captcha' or contains(concat(' ', normalize-space(@class), ' '), ' b_captcha ')]"
         ):
@@ -266,7 +270,34 @@ class WebSearchClient:
                     snippet,
                 )
             )
-        return _normalize_results(rows)
+        return _require_results_or_empty(
+            document,
+            _normalize_results(rows),
+            no_result_xpath=(
+                "//*[contains(concat(' ', normalize-space(@class), ' '), ' b_no ') "
+                "or contains(concat(' ', normalize-space(@class), ' '), ' b_noResults ')]"
+            ),
+            engine_name="Bing",
+        )
+
+
+def _parse_html(content: str, engine_name: str):
+    try:
+        return html.fromstring(content)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{engine_name} 返回了无法解析的页面") from error
+
+
+def _require_results_or_empty(
+    document,
+    results: list[SearchResult],
+    *,
+    no_result_xpath: str,
+    engine_name: str,
+) -> list[SearchResult]:
+    if results or document.xpath(no_result_xpath):
+        return results
+    raise RuntimeError(f"{engine_name} 页面结构无法解析")
 
 
 def _normalize_results(rows) -> list[SearchResult]:
