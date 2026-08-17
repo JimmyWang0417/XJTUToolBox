@@ -160,6 +160,13 @@ class WebSearchClient:
                 accept="text/html,application/xhtml+xml",
             )
             results = self._parse_sogou(content.decode(encoding, errors="replace"))
+        elif engine == "shenma":
+            content, encoding = self._fetch(
+                SHENMA_ENDPOINT,
+                params={"q": query},
+                accept="text/html,application/xhtml+xml",
+            )
+            results = self._parse_shenma(content.decode(encoding, errors="replace"))
         else:
             if not endpoint.rstrip("/").endswith("/search"):
                 endpoint = endpoint.rstrip("/") + "/search"
@@ -473,6 +480,69 @@ class WebSearchClient:
             engine_name="搜狗",
         )
 
+    @staticmethod
+    def _parse_shenma(content: str) -> list[SearchResult]:
+        document = _parse_html(content, "神马")
+        if document.xpath(
+            "//*[@id='verify' or @id='captcha' "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' verify ') "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' captcha ')]"
+        ):
+            raise SearchHumanVerificationRequired("神马要求人机验证")
+        rows = []
+        title_links = document.xpath(
+            "//a[@href and contains(concat(' ', normalize-space(@class), ' '), "
+            "' qk-link-wrapper ')][.//*[contains(concat(' ', normalize-space(@class), "
+            "' '), ' qk-title-text ')]]"
+        )
+        for link in title_links:
+            containers = link.xpath(
+                "ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' sc ')][1]"
+            )
+            snippets = (
+                containers[0].xpath(
+                    ".//*[contains(concat(' ', normalize-space(@class), ' '), "
+                    "' qk-paragraph-text ')]"
+                )
+                if containers
+                else []
+            )
+            rows.append(
+                (
+                    link.text_content(),
+                    link.get("href"),
+                    snippets[0].text_content() if snippets else "",
+                )
+            )
+        for node in document.xpath("//script[@type='application/json']/text()"):
+            try:
+                payload = json.loads(node)
+            except (TypeError, ValueError):
+                continue
+            for item in _walk_dicts(payload):
+                title = item.get("titleProps")
+                summary = item.get("summaryProps")
+                if not isinstance(title, dict):
+                    continue
+                rows.append(
+                    (
+                        _html_text(title.get("content")),
+                        title.get("dest_url"),
+                        _html_text(summary.get("content"))
+                        if isinstance(summary, dict)
+                        else "",
+                    )
+                )
+        return _require_results_or_empty(
+            document,
+            _normalize_results(rows),
+            no_result_xpath=(
+                "//*[contains(concat(' ', normalize-space(@class), ' '), ' no-result ') "
+                "or contains(text(), '没有找到相关结果')]"
+            ),
+            engine_name="神马",
+        )
+
 
 def _parse_html(content: str, engine_name: str):
     try:
@@ -550,6 +620,26 @@ def _host_matches(parsed, domain: str) -> bool:
     host = (parsed.hostname or "").lower()
     domain = domain.lower()
     return host == domain or host.endswith(f".{domain}")
+
+
+def _walk_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_dicts(child)
+
+
+def _html_text(value) -> str:
+    value = str(value or "")
+    if not value:
+        return ""
+    try:
+        return html.fromstring(f"<span>{value}</span>").text_content()
+    except (TypeError, ValueError):
+        return value
 
 
 def format_search_context(results: list[SearchResult]) -> str:
