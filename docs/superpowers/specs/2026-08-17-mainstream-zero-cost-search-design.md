@@ -96,7 +96,7 @@
 
 ## 失败语义
 
-- 验证码、Google `enablejs`、百度安全验证页和其它已知 challenge 抛出 `SearchHumanVerificationRequired`。
+- 验证码、Google `enablejs`、百度安全验证页和其它已知 challenge 抛出 `SearchHumanVerificationRequired`。百度结果页若以 3xx 跳向 `wappass.baidu.com` 或已知验证码路径，也按验证页归类；其它重定向继续按通用安全错误拒绝。
 - 显式引擎的人工验证只终止当次搜索，不改写用户保存的搜索开关或引擎。
 - 自动模式中只有 Bing、百度和 360 搜索全部返回人工验证时，才沿用现有保护行为关闭联网搜索。
 - 明确的无结果页返回空列表。页面无结果节点且无无结果标记时，报告页面无法解析，不伪装成零结果。
@@ -136,12 +136,12 @@
 
 | 来源 | 观测结果 | 解压正文大小 | 对设计的约束 |
 |---|---|---:|---|
-| 百度 | 200，9 个可用结果容器 | 1,307,857 | 保留 challenge 检测；安全 HEAD 解链 |
+| 百度 | 先观测到 200/9 个结果容器，后续同命令可变为 302 跳 `wappass.baidu.com` | 1,307,857（成功样本） | 保留 HTML 与 302 两种 challenge 检测；安全 HEAD 解链 |
 | Bing | 200，10 条结果 | 101,087 | 作为自动模式第一来源 |
 | Google | 200，`enablejs` 中间页，零结果节点 | 91,761 | 必须区分人工验证与空结果 |
 | 搜狗移动页 | 200，18 个 `vrResult` | 646,400 | 使用 `url` 参数本地解码 |
 | 360 搜索 | 200，7 个 `res-list` | 548,957 | 优先 `data-mdurl`，不请求跳转端点 |
-| 神马 | 200，11 个可用结果容器 | 412,074 | 支持直接链接和 hydration JSON |
+| 神马 | 先观测到 200/11 个结果容器，后续可返回 200 脚本型验证码页 | 412,074（成功样本） | 支持直接链接和 hydration JSON，并识别 `action=captcha`/punish 脚本 |
 | DuckDuckGo | 200，10 条结果 | 29,366 | 保留 challenge 检测 |
 
 所有样本都低于现有 2 MiB 解压响应上限，因此不放宽上限。
@@ -152,13 +152,13 @@
 
 从真实响应中提取最小结构片段，脱敏请求 ID、Cookie、个性化字段、跟踪参数和不必要内容，并在 fixture 注释中记录来源类型和脱敏方式。不提交 MiB 级完整搜索页。
 
-百度、Bing、搜狗、360、神马和 DuckDuckGo 的正常结果 fixture 可从已保留响应提取。Google `enablejs` 失败 fixture 从已观测响应提取。Google 正常结果 fixture 必须来自真实可解析响应，或具有可追溯路径的开源解析器测试样本；在获得该证据前，不用手写 HTML 宣称 Google 正常解析已验证。
+百度、Bing、搜狗、360、神马和 DuckDuckGo 的正常结果 fixture 可从已保留响应提取；神马脚本型验证码 fixture 也从后续真实响应脱敏提取。Google `enablejs` 失败 fixture 从已观测响应提取。Google 正常结果 fixture 必须来自真实可解析响应，或具有可追溯路径的开源解析器测试样本；在获得该证据前，不用手写 HTML 宣称 Google 正常解析已验证。
 
 ### 核心回归
 
 `test/ai_assistant/test_ai_features.py` 覆盖：
 
-- 每个 HTML 引擎的正常结果、明确无结果、验证页、异常结构和危险 URL；
+- 每个 HTML 引擎的正常结果、明确无结果、验证页、异常结构和危险 URL，包括百度验证码 302 与神马脚本型验证码；
 - 百度 HEAD 使用 `allow_redirects=False`、最多 `limit` 次、有效 `Location`、恶意 scheme、凭据 URL 和部分解链失败；
 - 搜狗 `url` 参数、360 `data-mdurl`、神马 `dest_url` 和 Bing/DuckDuckGo 跟踪链接的本地解码；
 - 自动模式顺序、首个成功即停止、失败回退、不请求 Google/DuckDuckGo、全部验证和混合失败；
