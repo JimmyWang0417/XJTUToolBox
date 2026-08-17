@@ -19,6 +19,7 @@ from ai_assistant.web_search import (
     BUILTIN_ENGINES,
     DUCKDUCKGO_ENDPOINT,
     SEARCH_ENGINES,
+    SHENMA_ENDPOINT,
     SO360_ENDPOINT,
     SOGOU_ENDPOINT,
     SearchHumanVerificationRequired,
@@ -568,6 +569,79 @@ class WebSearchTest(unittest.TestCase):
                 else:
                     with self.assertRaises(exception_type):
                         client.search("x", engine=engine)
+
+    def test_shenma_parses_html_and_hydration_json_through_one_filter(self):
+        response = FakeResponse(
+            text=(FIXTURE_DIR / "shenma_organic_result.html").read_text(encoding="utf-8"),
+            url=f"{SHENMA_ENDPOINT}?q=xjtu",
+        )
+        session = FakeSession(get_response=response)
+
+        results = WebSearchClient(session).search("xjtu", engine="shenma", limit=5)
+
+        self.assertEqual(
+            results,
+            [
+                SearchResult(
+                    "西安交通大学新闻网",
+                    "https://news.xjtu.edu.cn/",
+                    "西安交通大学新闻门户。",
+                ),
+                SearchResult(
+                    "西安交通大学",
+                    "http://www.xjtu.edu.cn",
+                    "教育部直属重点大学。",
+                ),
+            ],
+        )
+        self.assertEqual([call[1] for call in session.calls], [SHENMA_ENDPOINT])
+        self.assertEqual(session.calls[0][2]["params"], {"q": "xjtu"})
+
+    def test_shenma_ignores_malformed_json_and_filters_unsafe_destinations(self):
+        malformed_with_html = """
+            <section class="sc">
+              <a href="https://safe.test/" class="qk-link-wrapper">
+                <div class="qk-title-text">Safe HTML</div>
+              </a>
+              <div class="qk-paragraph-text">Snippet</div>
+            </section>
+            <script type="application/json" data-used-by="hydrate">{broken</script>
+        """
+        response = FakeResponse(text=malformed_with_html, url=SHENMA_ENDPOINT)
+        self.assertEqual(
+            WebSearchClient(FakeSession(get_response=response)).search(
+                "x", engine="shenma"
+            ),
+            [SearchResult("Safe HTML", "https://safe.test/", "Snippet")],
+        )
+
+        unsafe = """
+            <section class="sc"><a href="javascript:alert(1)" class="qk-link-wrapper">
+              <div class="qk-title-text">Unsafe HTML</div></a></section>
+            <script type="application/json" data-used-by="hydrate">
+              {"data":{"titleProps":{"content":"Unsafe JSON","dest_url":"https://user:secret@source.test/"}}}
+            </script>
+        """
+        with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
+            WebSearchClient(
+                FakeSession(get_response=FakeResponse(text=unsafe, url=SHENMA_ENDPOINT))
+            ).search("x", engine="shenma")
+
+    def test_shenma_distinguishes_challenge_empty_and_unknown_structure(self):
+        cases = (
+            ('<div class="captcha">captcha</div>', SearchHumanVerificationRequired),
+            ('<div class="no-result">没有找到相关结果</div>', None),
+            ('<div>changed layout</div>', RuntimeError),
+        )
+        for content, exception_type in cases:
+            with self.subTest(exception=exception_type):
+                response = FakeResponse(text=content, url=SHENMA_ENDPOINT)
+                client = WebSearchClient(FakeSession(get_response=response))
+                if exception_type is None:
+                    self.assertEqual(client.search("x", engine="shenma"), [])
+                else:
+                    with self.assertRaises(exception_type):
+                        client.search("x", engine="shenma")
 
     def test_duckduckgo_human_challenge_is_not_misreported_as_empty_results(self):
         challenged = FakeResponse(
