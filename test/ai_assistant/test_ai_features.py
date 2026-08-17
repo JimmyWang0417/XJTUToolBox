@@ -14,6 +14,7 @@ from ai_assistant.markdown_render import render_markdown_fragment
 from ai_assistant.model_catalog import ModelCatalogClient, ModelOperationCancelled
 from ai_assistant.providers import PRESETS, ProviderConfig, validate_config
 from ai_assistant.web_search import (
+    BAIDU_ENDPOINT,
     BING_ENDPOINT,
     BUILTIN_ENGINES,
     DUCKDUCKGO_ENDPOINT,
@@ -368,6 +369,113 @@ class WebSearchTest(unittest.TestCase):
                     WebSearchClient(FakeSession(get_response=response)).search(
                         "x", engine=engine
                     )
+                self.assertTrue(response.closed)
+
+    def test_baidu_resolves_only_selected_results_with_safe_head_requests(self):
+        page = FakeResponse(
+            text=(FIXTURE_DIR / "baidu_organic_result.html").read_text(encoding="utf-8"),
+            url=f"{BAIDU_ENDPOINT}?wd=xjtu",
+        )
+        resolved = FakeResponse(
+            status=302,
+            url="https://www.baidu.com/link?url=fixture-token",
+            headers={"Location": "https://www.xjtu.edu.cn/"},
+        )
+        session = FakeSession(get_response=page, head_response=resolved)
+
+        results = WebSearchClient(session).search("xjtu", engine="baidu", limit=1)
+
+        self.assertEqual(
+            results,
+            [
+                SearchResult(
+                    "西安交通大学",
+                    "https://www.xjtu.edu.cn/",
+                    "西安交通大学是教育部直属重点大学。",
+                )
+            ],
+        )
+        self.assertEqual(session.calls[0][1], BAIDU_ENDPOINT)
+        self.assertEqual(session.calls[0][2]["params"], {"wd": "xjtu"})
+        method, url, kwargs = session.calls[1]
+        self.assertEqual((method, url), ("HEAD", "https://www.baidu.com/link?url=fixture-token"))
+        self.assertFalse(kwargs["allow_redirects"])
+        self.assertEqual(kwargs["timeout"], (10, 20))
+        self.assertTrue(page.closed)
+        self.assertTrue(resolved.closed)
+
+    def test_baidu_drops_unsafe_and_failed_redirect_targets_with_limit_bound(self):
+        links = "".join(
+            '<div class="c-container"><h3><a href="https://www.baidu.com/link?url=%d">R%d</a></h3></div>'
+            % (index, index)
+            for index in range(6)
+        )
+        page = FakeResponse(
+            text=f"<html><body>{links}</body></html>",
+            url=f"{BAIDU_ENDPOINT}?wd=x",
+        )
+        javascript = FakeResponse(
+            status=302,
+            headers={"Location": "javascript:alert(1)"},
+        )
+        credentials = FakeResponse(
+            status=302,
+            headers={"Location": "https://user:secret@source.test/"},
+        )
+        missing = FakeResponse(status=302)
+        wrong_status = FakeResponse(
+            status=200,
+            headers={"Location": "https://source.test/ignored"},
+        )
+        session = FakeSession(
+            get_response=page,
+            head_response=[
+                javascript,
+                credentials,
+                missing,
+                wrong_status,
+                requests.Timeout(),
+            ],
+        )
+
+        self.assertEqual(
+            WebSearchClient(session).search("x", engine="baidu", limit=5),
+            [],
+        )
+        self.assertEqual(
+            [call[0] for call in session.calls],
+            ["GET", "HEAD", "HEAD", "HEAD", "HEAD", "HEAD"],
+        )
+        self.assertTrue(
+            all(
+                response.closed
+                for response in (page, javascript, credentials, missing, wrong_status)
+            )
+        )
+
+    def test_baidu_distinguishes_challenge_empty_and_unknown_structure(self):
+        cases = (
+            (
+                '<html><div id="verify-form">安全验证</div></html>',
+                SearchHumanVerificationRequired,
+                "人机验证",
+            ),
+            (
+                '<html><div class="op_sp_realtime_n_result">没有找到相关结果</div></html>',
+                None,
+                "",
+            ),
+            ("<html><body>changed layout</body></html>", RuntimeError, "页面结构无法解析"),
+        )
+        for content, exception_type, message in cases:
+            with self.subTest(message=message or "empty"):
+                response = FakeResponse(text=content, url=BAIDU_ENDPOINT)
+                client = WebSearchClient(FakeSession(get_response=response))
+                if exception_type is None:
+                    self.assertEqual(client.search("x", engine="baidu"), [])
+                else:
+                    with self.assertRaisesRegex(exception_type, message):
+                        client.search("x", engine="baidu")
                 self.assertTrue(response.closed)
 
     def test_duckduckgo_human_challenge_is_not_misreported_as_empty_results(self):

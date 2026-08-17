@@ -138,6 +138,14 @@ class WebSearchClient:
                 accept="text/html,application/xhtml+xml",
             )
             results = self._parse_bing(content.decode(encoding, errors="replace"))
+        elif engine == "baidu":
+            content, encoding = self._fetch(
+                BAIDU_ENDPOINT,
+                params={"wd": query},
+                accept="text/html,application/xhtml+xml",
+            )
+            results = self._parse_baidu(content.decode(encoding, errors="replace"))
+            return self._resolve_baidu_results(results, limit)
         else:
             if not endpoint.rstrip("/").endswith("/search"):
                 endpoint = endpoint.rstrip("/") + "/search"
@@ -148,6 +156,55 @@ class WebSearchClient:
             )
             results = self._parse_searxng(content)
         return results[:limit]
+
+    def _resolve_baidu_results(
+        self,
+        results: list[SearchResult],
+        limit: int,
+    ) -> list[SearchResult]:
+        resolved = []
+        for result in results[:limit]:
+            parsed = urlparse(result.url)
+            host = (parsed.hostname or "").lower()
+            if not (
+                (host == "baidu.com" or host.endswith(".baidu.com"))
+                and parsed.path.startswith("/link")
+            ):
+                resolved.extend(
+                    _normalize_results([(result.title, result.url, result.snippet)])
+                )
+                continue
+            response = None
+            try:
+                response = self.session.head(
+                    result.url,
+                    headers=_BROWSER_HEADERS,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+                status = int(response.status_code)
+                location = (
+                    str(response.headers.get("Location", ""))
+                    if 300 <= status < 400
+                    else ""
+                )
+                resolved.extend(
+                    _normalize_results(
+                        [
+                            (
+                                result.title,
+                                urljoin(result.url, location) if location else "",
+                                result.snippet,
+                            )
+                        ]
+                    )
+                )
+            except requests.RequestException:
+                continue
+            finally:
+                if response is not None:
+                    response.close()
+        return resolved
 
     def _fetch(
         self,
@@ -278,6 +335,42 @@ class WebSearchClient:
                 "or contains(concat(' ', normalize-space(@class), ' '), ' b_noResults ')]"
             ),
             engine_name="Bing",
+        )
+
+    @staticmethod
+    def _parse_baidu(content: str) -> list[SearchResult]:
+        document = _parse_html(content, "百度")
+        if document.xpath(
+            "//*[@id='verify-form' or @id='wappass_verify_form' "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' verify ')]"
+        ):
+            raise SearchHumanVerificationRequired("百度要求人机验证")
+        rows = []
+        for result in document.xpath(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' c-container ')]"
+        ):
+            links = result.xpath(".//h3//a[@href]")
+            if not links:
+                continue
+            link = links[0]
+            snippets = result.xpath(
+                ".//*[contains(concat(' ', normalize-space(@class), ' '), ' c-abstract ')]"
+            )
+            rows.append(
+                (
+                    link.text_content(),
+                    link.get("href"),
+                    snippets[0].text_content() if snippets else "",
+                )
+            )
+        return _require_results_or_empty(
+            document,
+            _normalize_results(rows),
+            no_result_xpath=(
+                "//*[contains(concat(' ', normalize-space(@class), ' '), "
+                "' op_sp_realtime_n_result ') or contains(text(), '没有找到相关结果')]"
+            ),
+            engine_name="百度",
         )
 
 
