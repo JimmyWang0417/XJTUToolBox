@@ -146,6 +146,20 @@ class WebSearchClient:
             )
             results = self._parse_baidu(content.decode(encoding, errors="replace"))
             return self._resolve_baidu_results(results, limit)
+        elif engine == "so360":
+            content, encoding = self._fetch(
+                SO360_ENDPOINT,
+                params={"q": query},
+                accept="text/html,application/xhtml+xml",
+            )
+            results = self._parse_so360(content.decode(encoding, errors="replace"))
+        elif engine == "sogou":
+            content, encoding = self._fetch(
+                SOGOU_ENDPOINT,
+                params={"keyword": query},
+                accept="text/html,application/xhtml+xml",
+            )
+            results = self._parse_sogou(content.decode(encoding, errors="replace"))
         else:
             if not endpoint.rstrip("/").endswith("/search"):
                 endpoint = endpoint.rstrip("/") + "/search"
@@ -373,6 +387,92 @@ class WebSearchClient:
             engine_name="百度",
         )
 
+    @staticmethod
+    def _parse_so360(content: str) -> list[SearchResult]:
+        document = _parse_html(content, "360 搜索")
+        if document.xpath(
+            "//*[@id='verify' or @id='captcha' "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' verify ') "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' captcha ')]"
+        ):
+            raise SearchHumanVerificationRequired("360 搜索要求人机验证")
+        rows = []
+        for result in document.xpath(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' res-list ')]"
+        ):
+            links = result.xpath(".//h3//a[@href]")
+            if not links:
+                continue
+            link = links[0]
+            href = str(link.get("href") or "")
+            target = str(link.get("data-mdurl") or "")
+            parsed_href = urlparse(href)
+            if not target and not (
+                _host_matches(parsed_href, "so.com")
+                and parsed_href.path.startswith("/link")
+            ):
+                target = href
+            snippets = result.xpath(
+                ".//*[contains(concat(' ', normalize-space(@class), ' '), ' res-desc ')]"
+            )
+            rows.append(
+                (
+                    link.text_content(),
+                    target,
+                    snippets[0].text_content() if snippets else "",
+                )
+            )
+        return _require_results_or_empty(
+            document,
+            _normalize_results(rows),
+            no_result_xpath=(
+                "//*[contains(concat(' ', normalize-space(@class), ' '), ' no-result ') "
+                "or contains(text(), '没有找到相关结果')]"
+            ),
+            engine_name="360 搜索",
+        )
+
+    @staticmethod
+    def _parse_sogou(content: str) -> list[SearchResult]:
+        document = _parse_html(content, "搜狗")
+        if document.xpath(
+            "//*[@id='verify' or @id='captcha' "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' verify ') "
+            "or contains(concat(' ', normalize-space(@class), ' '), ' captcha ')]"
+        ):
+            raise SearchHumanVerificationRequired("搜狗要求人机验证")
+        rows = []
+        for result in document.xpath(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' vrResult ')]"
+        ):
+            links = result.xpath(
+                ".//h3//a[contains(concat(' ', normalize-space(@class), ' '), ' resultLink ')][@href]"
+            )
+            if not links:
+                continue
+            link = links[0]
+            parsed = urlparse(urljoin(SOGOU_ENDPOINT, str(link.get("href") or "")))
+            target = parse_qs(parsed.query).get("url", [""])[0]
+            snippets = result.xpath(
+                ".//*[contains(concat(' ', normalize-space(@class), ' '), ' txt-summary ')]"
+            )
+            rows.append(
+                (
+                    link.text_content(),
+                    target,
+                    snippets[0].text_content() if snippets else "",
+                )
+            )
+        return _require_results_or_empty(
+            document,
+            _normalize_results(rows),
+            no_result_xpath=(
+                "//*[contains(concat(' ', normalize-space(@class), ' '), ' no-result ') "
+                "or contains(text(), '未找到相关结果')]"
+            ),
+            engine_name="搜狗",
+        )
+
 
 def _parse_html(content: str, engine_name: str):
     try:
@@ -444,6 +544,12 @@ def _origin(parsed) -> tuple[str, str, int | None]:
     if port is None:
         port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
     return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
+
+
+def _host_matches(parsed, domain: str) -> bool:
+    host = (parsed.hostname or "").lower()
+    domain = domain.lower()
+    return host == domain or host.endswith(f".{domain}")
 
 
 def format_search_context(results: list[SearchResult]) -> str:
