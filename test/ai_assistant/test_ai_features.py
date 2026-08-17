@@ -23,6 +23,7 @@ from ai_assistant.web_search import (
     SHENMA_ENDPOINT,
     SO360_ENDPOINT,
     SOGOU_ENDPOINT,
+    SearchAllSourcesVerificationRequired,
     SearchHumanVerificationRequired,
     SearchResult,
     WebSearchClient,
@@ -785,81 +786,133 @@ class WebSearchTest(unittest.TestCase):
         self.assertEqual([one.title for one in results], ["Xi'an Jiaotong University"])
         self.assertEqual([call[1] for call in session.calls], [BING_ENDPOINT])
 
-    def test_auto_search_falls_back_from_bing_challenge_to_duckduckgo(self):
+    def test_auto_search_falls_back_bing_baidu_so360_in_fixed_order(self):
         bing = FakeResponse(
             text='<form id="b_captcha"></form>',
             url=BING_ENDPOINT,
         )
-        duckduckgo = FakeResponse(
-            text=(FIXTURE_DIR / "duckduckgo_organic_result.txt").read_text(
-                encoding="utf-8"
-            ),
-            url=DUCKDUCKGO_ENDPOINT,
+        baidu = FakeResponse(
+            text='<div class="op_sp_realtime_n_result">没有找到相关结果</div>',
+            url=BAIDU_ENDPOINT,
         )
-        session = FakeSession(get_response=[bing, duckduckgo])
+        so360 = FakeResponse(
+            text=(FIXTURE_DIR / "so360_organic_result.html").read_text(encoding="utf-8"),
+            url=SO360_ENDPOINT,
+        )
+        session = FakeSession(get_response=[bing, baidu, so360])
 
         results = WebSearchClient(session).search("x", engine="auto", limit=3)
 
-        self.assertEqual([one.title for one in results], ["Welcome to XJTU"])
+        self.assertEqual([one.title for one in results], ["西安交通大学新闻网"])
         self.assertEqual(
             [call[1] for call in session.calls],
-            [BING_ENDPOINT, DUCKDUCKGO_ENDPOINT],
+            [BING_ENDPOINT, BAIDU_ENDPOINT, SO360_ENDPOINT],
         )
 
-    def test_auto_search_falls_back_after_empty_results(self):
+    def test_auto_search_stops_after_baidu_returns_resolved_results(self):
         bing = FakeResponse(
-            text="<html></html>",
+            text='<li class="b_no">没有与此相关的结果</li>',
             url=BING_ENDPOINT,
         )
-        duckduckgo = FakeResponse(
-            text=(FIXTURE_DIR / "duckduckgo_organic_result.txt").read_text(
-                encoding="utf-8"
-            ),
-            url=DUCKDUCKGO_ENDPOINT,
+        baidu = FakeResponse(
+            text=(FIXTURE_DIR / "baidu_organic_result.html").read_text(encoding="utf-8"),
+            url=BAIDU_ENDPOINT,
         )
-        session = FakeSession(get_response=[bing, duckduckgo])
+        resolved = FakeResponse(
+            status=302,
+            headers={"Location": "https://www.xjtu.edu.cn/"},
+        )
+        session = FakeSession(get_response=[bing, baidu], head_response=resolved)
 
         results = WebSearchClient(session).search("x", engine="auto", limit=3)
 
-        self.assertEqual([one.title for one in results], ["Welcome to XJTU"])
-        self.assertEqual(len(session.calls), 2)
+        self.assertEqual([one.url for one in results], ["https://www.xjtu.edu.cn/"])
+        self.assertEqual(
+            [(call[0], call[1]) for call in session.calls],
+            [
+                ("GET", BING_ENDPOINT),
+                ("GET", BAIDU_ENDPOINT),
+                ("HEAD", "https://www.baidu.com/link?url=fixture-token"),
+            ],
+        )
 
     def test_auto_search_reports_all_challenges_and_mixed_failures(self):
-        duckduckgo_challenge = FakeResponse(
-            text=(FIXTURE_DIR / "duckduckgo_challenge.txt").read_text(encoding="utf-8"),
-            url=DUCKDUCKGO_ENDPOINT,
-        )
-        bing_challenge = FakeResponse(
-            text='<form id="b_captcha"></form>',
-            url="https://www.bing.com/search?q=x",
-        )
-        with self.assertRaisesRegex(SearchHumanVerificationRequired, "均要求人机验证"):
-            WebSearchClient(FakeSession(get_response=[
-                bing_challenge,
-                duckduckgo_challenge,
-            ])).search("x", engine="auto", limit=3)
+        challenges = [
+            FakeResponse(text='<form id="b_captcha"></form>', url=BING_ENDPOINT),
+            FakeResponse(text='<div id="verify-form"></div>', url=BAIDU_ENDPOINT),
+            FakeResponse(text='<div id="verify"></div>', url=SO360_ENDPOINT),
+        ]
+        with self.assertRaisesRegex(
+            SearchAllSourcesVerificationRequired,
+            "均要求人机验证",
+        ):
+            WebSearchClient(FakeSession(get_response=challenges)).search(
+                "x", engine="auto", limit=3
+            )
 
         with self.assertRaisesRegex(RuntimeError, "内置联网搜索暂时不可用"):
             WebSearchClient(FakeSession(get_response=[
                 requests.Timeout(),
-                FakeResponse(text="<html></html>", url=DUCKDUCKGO_ENDPOINT),
+                FakeResponse(
+                    text='<div class="op_sp_realtime_n_result">没有找到相关结果</div>',
+                    url=BAIDU_ENDPOINT,
+                ),
+                FakeResponse(text="<html>changed layout</html>", url=SO360_ENDPOINT),
             ])).search("x", engine="auto", limit=3)
 
-    def test_one_challenge_and_one_empty_source_do_not_disable_search(self):
+    def test_one_challenge_and_two_empty_sources_do_not_raise_aggregate_verification(self):
         bing_challenge = FakeResponse(
             text='<form id="b_captcha"></form>',
             url=BING_ENDPOINT,
         )
-        duckduckgo_empty = FakeResponse(
-            text="<html></html>",
-            url=DUCKDUCKGO_ENDPOINT,
+        baidu_empty = FakeResponse(
+            text='<div class="op_sp_realtime_n_result">没有找到相关结果</div>',
+            url=BAIDU_ENDPOINT,
+        )
+        so360_empty = FakeResponse(
+            text='<div class="no-result">没有找到相关结果</div>',
+            url=SO360_ENDPOINT,
         )
 
         with self.assertRaisesRegex(RuntimeError, "内置联网搜索暂时不可用"):
             WebSearchClient(FakeSession(get_response=[
                 bing_challenge,
-                duckduckgo_empty,
+                baidu_empty,
+                so360_empty,
             ])).search("x", engine="auto", limit=3)
+
+    def test_auto_request_bound_is_three_pages_plus_ten_baidu_heads(self):
+        bing_empty = FakeResponse(
+            text='<li class="b_no">没有与此相关的结果</li>',
+            url=BING_ENDPOINT,
+        )
+        links = "".join(
+            '<div class="c-container"><h3><a href="https://www.baidu.com/link?url=%d">R%d</a></h3></div>'
+            % (index, index)
+            for index in range(11)
+        )
+        baidu = FakeResponse(text=links, url=BAIDU_ENDPOINT)
+        so360_empty = FakeResponse(
+            text='<div class="no-result">没有找到相关结果</div>',
+            url=SO360_ENDPOINT,
+        )
+        unsafe_redirects = [
+            FakeResponse(status=302, headers={"Location": "javascript:alert(1)"})
+            for _index in range(10)
+        ]
+        session = FakeSession(
+            get_response=[bing_empty, baidu, so360_empty],
+            head_response=unsafe_redirects,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "内置联网搜索暂时不可用"):
+            WebSearchClient(session).search("x", engine="auto", limit=10)
+
+        self.assertEqual(len(session.calls), 13)
+        self.assertEqual(sum(call[0] == "GET" for call in session.calls), 3)
+        self.assertEqual(sum(call[0] == "HEAD" for call in session.calls), 10)
+        self.assertNotIn(GOOGLE_ENDPOINT, [call[1] for call in session.calls])
+        self.assertNotIn(DUCKDUCKGO_ENDPOINT, [call[1] for call in session.calls])
 
 
 class CapabilityAndMarkdownTest(unittest.TestCase):

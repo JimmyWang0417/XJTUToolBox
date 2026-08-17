@@ -101,7 +101,7 @@ class WebSearchClient:
 
     def _search_auto(self, query: str, limit: int) -> list[SearchResult]:
         challenges = 0
-        for engine in ("bing", "duckduckgo"):
+        for engine in ("bing", "baidu", "so360"):
             try:
                 results = self._search_one(query, engine, "", limit)
             except SearchHumanVerificationRequired:
@@ -111,9 +111,9 @@ class WebSearchClient:
             else:
                 if results:
                     return results
-        if challenges == 2:
-            raise SearchHumanVerificationRequired(
-                "公开搜索服务均要求人机验证；已自动关闭联网搜索"
+        if challenges == 3:
+            raise SearchAllSourcesVerificationRequired(
+                "自动模式的公开搜索服务均要求人机验证；已自动关闭联网搜索"
             )
         raise RuntimeError("内置联网搜索暂时不可用，请稍后重试")
 
@@ -333,9 +333,7 @@ class WebSearchClient:
         if document.xpath(
             "//*[@id='b_captcha' or contains(concat(' ', normalize-space(@class), ' '), ' b_captcha ')]"
         ):
-            raise SearchHumanVerificationRequired(
-                "Bing 要求人机验证；正在尝试其它公开搜索来源"
-            )
+            raise SearchHumanVerificationRequired("Bing 要求人机验证")
         rows = []
         for result in document.xpath(
             "//li[contains(concat(' ', normalize-space(@class), ' '), ' b_algo ')]"
