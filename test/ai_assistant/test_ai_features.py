@@ -13,12 +13,19 @@ from ai_assistant.markdown_render import render_markdown_fragment
 from ai_assistant.model_catalog import ModelCatalogClient, ModelOperationCancelled
 from ai_assistant.providers import PRESETS, ProviderConfig, validate_config
 from ai_assistant.web_search import (
+    BING_ENDPOINT,
+    BUILTIN_ENGINES,
+    DUCKDUCKGO_ENDPOINT,
+    SEARCH_ENGINES,
     SearchHumanVerificationRequired,
     WebSearchClient,
     validate_search_settings,
 )
 from ai_assistant import ChatMessage
 from score_statistics import calculate_score_statistics
+
+
+FIXTURE_DIR = Path(__file__).with_name("fixtures")
 
 
 class FakeResponse:
@@ -55,9 +62,12 @@ class FakeSession:
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
-        if isinstance(self.get_response, Exception):
-            raise self.get_response
-        return self.get_response
+        response = self.get_response
+        if isinstance(response, list):
+            response = response.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
@@ -76,7 +86,7 @@ class IndependentProtocolConfigTest(unittest.TestCase):
         self.assertEqual(checked.preset_id, "deepseek")
         self.assertEqual(checked.protocol, "anthropic")
 
-    def test_v1_profile_migrates_to_default_off_capabilities_and_v2(self):
+    def test_v1_profile_migrates_to_default_off_capabilities_and_current_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             profile = AIProfile.default()
@@ -89,6 +99,60 @@ class IndependentProtocolConfigTest(unittest.TestCase):
             self.assertEqual(loaded.capability_ids, ())
             store.save_profiles([loaded])
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], SCHEMA_VERSION)
+
+    def test_v2_search_engines_migrate_without_changing_network_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for legacy_engine, expected_engine, expected_endpoint in (
+                ("duckduckgo", "duckduckgo", ""),
+                ("bing", "searxng", "https://search.example/"),
+                ("baidu", "searxng", "https://search.example/"),
+                ("google", "searxng", "https://search.example/"),
+                ("searxng", "searxng", "https://search.example/"),
+            ):
+                with self.subTest(engine=legacy_engine):
+                    path = Path(directory) / f"{legacy_engine}.json"
+                    legacy = replace(
+                        AIProfile.default(),
+                        search_engine=legacy_engine,
+                        search_endpoint="https://search.example/",
+                    )
+                    path.write_text(
+                        json.dumps({"version": 2, "profiles": [legacy.__dict__]}),
+                        encoding="utf-8",
+                    )
+
+                    loaded = AIConfigStore(path, keyring_backend=object()).load_profiles()[0]
+
+                    self.assertEqual(loaded.search_engine, expected_engine)
+                    self.assertEqual(loaded.search_endpoint, expected_endpoint)
+
+    def test_current_search_profiles_round_trip_builtin_and_self_hosted_modes(self):
+        self.assertEqual(SCHEMA_VERSION, 3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles.json"
+            profiles = [
+                replace(AIProfile.default(), id="auto", search_engine="auto"),
+                replace(
+                    AIProfile.default(),
+                    id="bing",
+                    search_engine="bing",
+                    search_endpoint="https://ignored.example",
+                ),
+                replace(
+                    AIProfile.default(),
+                    id="searxng",
+                    search_engine="searxng",
+                    search_endpoint="https://search.example",
+                ),
+            ]
+            store = AIConfigStore(path, keyring_backend=object())
+            store.save_profiles(profiles)
+
+            loaded = {one.id: one for one in store.load_profiles()}
+
+        self.assertEqual(loaded["auto"].search_endpoint, "")
+        self.assertEqual(loaded["bing"].search_endpoint, "")
+        self.assertEqual(loaded["searxng"].search_endpoint, "https://search.example/")
 
     def test_retired_deepseek_models_are_migrated_and_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -157,6 +221,31 @@ class ModelCatalogTest(unittest.TestCase):
 
 
 class WebSearchTest(unittest.TestCase):
+    def test_search_catalog_has_approved_ids_labels_and_builtin_boundary(self):
+        self.assertEqual(
+            SEARCH_ENGINES,
+            (
+                ("auto", "自动（直连推荐）"),
+                ("baidu", "百度（直连）"),
+                ("bing", "Bing（直连）"),
+                ("google", "Google（需要代理）"),
+                ("sogou", "搜狗（直连）"),
+                ("so360", "360 搜索（直连）"),
+                ("shenma", "神马（直连）"),
+                ("duckduckgo", "DuckDuckGo（需要代理）"),
+                ("searxng", "SearXNG（自托管）"),
+            ),
+        )
+        self.assertEqual(
+            BUILTIN_ENGINES,
+            {"auto", "baidu", "bing", "google", "sogou", "so360", "shenma", "duckduckgo"},
+        )
+        for engine, _label in SEARCH_ENGINES[:-1]:
+            self.assertEqual(
+                validate_search_settings(engine, "https://ignored.example"),
+                (engine, ""),
+            )
+
     def test_custom_searxng_is_bounded_and_parsed(self):
         response = FakeResponse(
             {"results": [
@@ -221,21 +310,142 @@ class WebSearchTest(unittest.TestCase):
             )
         self.assertTrue(challenged.closed)
 
-    def test_mainstream_engines_use_configured_searxng_and_explicit_engine(self):
-        for engine in ("bing", "baidu", "google"):
-            response = FakeResponse(
-                {"results": [{"title": engine, "url": f"https://{engine}.example/result"}]},
-                url="https://search.example/search",
-            )
-            session = FakeSession(get_response=response)
-            results = WebSearchClient(session).search(
-                "x", engine=engine, endpoint="https://search.example", limit=3
-            )
-            self.assertEqual(results[0].title, engine)
-            call = session.calls[0]
-            self.assertEqual(call[1], "https://search.example/search")
-            self.assertEqual(call[2]["params"]["engines"], engine)
-            self.assertEqual(call[2]["params"]["format"], "json")
+    def test_bing_direct_search_parses_organic_results_and_filters_unsafe_urls(self):
+        real_fixture = (FIXTURE_DIR / "bing_organic_result.txt").read_text(
+            encoding="utf-8"
+        )
+        response = FakeResponse(
+            text=real_fixture.replace(
+                "</ol>",
+                '<li class="b_algo"><h2><a href="javascript:alert(1)">'
+                "Unsafe result</a></h2></li></ol>",
+            ),
+            url="https://www.bing.com/search?q=x",
+        )
+        session = FakeSession(get_response=response)
+
+        results = WebSearchClient(session).search(
+            "x", engine="bing", endpoint="https://ignored.example", limit=3
+        )
+
+        self.assertEqual(
+            [(one.title, one.url, one.snippet) for one in results],
+            [
+                (
+                    "Xi'an Jiaotong University",
+                    "https://en.xjtu.edu.cn/",
+                    "Teaching and learning news from XJTU.",
+                )
+            ],
+        )
+        self.assertEqual(session.calls[0][1], BING_ENDPOINT)
+        self.assertNotIn("engines", session.calls[0][2]["params"])
+
+    def test_bing_tracking_links_are_unwrapped_without_following_redirects(self):
+        response = FakeResponse(
+            text="""
+                <li class="b_algo"><h2><a href="https://www.bing.com/ck/a?u=a1aHR0cHM6Ly93d3cueGp0dS5lZHUuY24v">
+                  西安交通大学
+                </a></h2></li>
+            """,
+            url="https://www.bing.com/search?q=x",
+        )
+        session = FakeSession(get_response=response)
+
+        results = WebSearchClient(session).search("x", engine="bing", limit=3)
+
+        self.assertEqual(results[0].url, "https://www.xjtu.edu.cn/")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_auto_search_returns_bing_without_second_request(self):
+        bing = FakeResponse(
+            text=(FIXTURE_DIR / "bing_organic_result.txt").read_text(encoding="utf-8"),
+            url=BING_ENDPOINT,
+        )
+        session = FakeSession(get_response=[bing])
+
+        results = WebSearchClient(session).search("x", engine="auto", limit=3)
+
+        self.assertEqual([one.title for one in results], ["Xi'an Jiaotong University"])
+        self.assertEqual([call[1] for call in session.calls], [BING_ENDPOINT])
+
+    def test_auto_search_falls_back_from_bing_challenge_to_duckduckgo(self):
+        bing = FakeResponse(
+            text='<form id="b_captcha"></form>',
+            url=BING_ENDPOINT,
+        )
+        duckduckgo = FakeResponse(
+            text=(FIXTURE_DIR / "duckduckgo_organic_result.txt").read_text(
+                encoding="utf-8"
+            ),
+            url=DUCKDUCKGO_ENDPOINT,
+        )
+        session = FakeSession(get_response=[bing, duckduckgo])
+
+        results = WebSearchClient(session).search("x", engine="auto", limit=3)
+
+        self.assertEqual([one.title for one in results], ["Welcome to XJTU"])
+        self.assertEqual(
+            [call[1] for call in session.calls],
+            [BING_ENDPOINT, DUCKDUCKGO_ENDPOINT],
+        )
+
+    def test_auto_search_falls_back_after_empty_results(self):
+        bing = FakeResponse(
+            text="<html></html>",
+            url=BING_ENDPOINT,
+        )
+        duckduckgo = FakeResponse(
+            text=(FIXTURE_DIR / "duckduckgo_organic_result.txt").read_text(
+                encoding="utf-8"
+            ),
+            url=DUCKDUCKGO_ENDPOINT,
+        )
+        session = FakeSession(get_response=[bing, duckduckgo])
+
+        results = WebSearchClient(session).search("x", engine="auto", limit=3)
+
+        self.assertEqual([one.title for one in results], ["Welcome to XJTU"])
+        self.assertEqual(len(session.calls), 2)
+
+    def test_auto_search_reports_all_challenges_and_mixed_failures(self):
+        duckduckgo_challenge = FakeResponse(
+            text=(FIXTURE_DIR / "duckduckgo_challenge.txt").read_text(encoding="utf-8"),
+            url=DUCKDUCKGO_ENDPOINT,
+        )
+        bing_challenge = FakeResponse(
+            text='<form id="b_captcha"></form>',
+            url="https://www.bing.com/search?q=x",
+        )
+        with self.assertRaisesRegex(SearchHumanVerificationRequired, "均要求人机验证"):
+            WebSearchClient(FakeSession(get_response=[
+                bing_challenge,
+                duckduckgo_challenge,
+            ])).search("x", engine="auto", limit=3)
+
+        import requests
+
+        with self.assertRaisesRegex(RuntimeError, "内置联网搜索暂时不可用"):
+            WebSearchClient(FakeSession(get_response=[
+                requests.Timeout(),
+                FakeResponse(text="<html></html>", url=DUCKDUCKGO_ENDPOINT),
+            ])).search("x", engine="auto", limit=3)
+
+    def test_one_challenge_and_one_empty_source_do_not_disable_search(self):
+        bing_challenge = FakeResponse(
+            text='<form id="b_captcha"></form>',
+            url=BING_ENDPOINT,
+        )
+        duckduckgo_empty = FakeResponse(
+            text="<html></html>",
+            url=DUCKDUCKGO_ENDPOINT,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "内置联网搜索暂时不可用"):
+            WebSearchClient(FakeSession(get_response=[
+                bing_challenge,
+                duckduckgo_empty,
+            ])).search("x", engine="auto", limit=3)
 
 
 class CapabilityAndMarkdownTest(unittest.TestCase):
