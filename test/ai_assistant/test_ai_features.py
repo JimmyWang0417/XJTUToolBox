@@ -459,6 +459,30 @@ class WebSearchTest(unittest.TestCase):
         self.assertTrue(page.closed)
         self.assertTrue(resolved.closed)
 
+    def test_baidu_does_not_head_external_link_path(self):
+        page = FakeResponse(
+            text=(
+                '<div class="c-container"><h3><a '
+                'href="https://evil.example/link?url=opaque">外站结果</a></h3></div>'
+            ),
+            url=f"{BAIDU_ENDPOINT}?wd=x",
+        )
+        attacker_response = FakeResponse(
+            status=302,
+            headers={"Location": "https://attacker.example/payload"},
+        )
+        session = FakeSession(get_response=page, head_response=attacker_response)
+
+        results = WebSearchClient(session).search("x", engine="baidu", limit=1)
+
+        self.assertEqual(
+            results,
+            [SearchResult("外站结果", "https://evil.example/link?url=opaque", "")],
+        )
+        self.assertEqual([call[0] for call in session.calls], ["GET"])
+        self.assertTrue(page.closed)
+        self.assertFalse(attacker_response.closed)
+
     def test_baidu_drops_unsafe_and_failed_redirect_targets_with_limit_bound(self):
         links = "".join(
             '<div class="c-container"><h3><a href="https://www.baidu.com/link?url=%d">R%d</a></h3></div>'
