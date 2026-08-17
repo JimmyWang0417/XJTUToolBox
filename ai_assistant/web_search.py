@@ -167,6 +167,13 @@ class WebSearchClient:
                 accept="text/html,application/xhtml+xml",
             )
             results = self._parse_shenma(content.decode(encoding, errors="replace"))
+        elif engine == "google":
+            content, encoding = self._fetch(
+                GOOGLE_ENDPOINT,
+                params={"q": query},
+                accept="text/html,application/xhtml+xml",
+            )
+            results = self._parse_google(content.decode(encoding, errors="replace"))
         else:
             if not endpoint.rstrip("/").endswith("/search"):
                 endpoint = endpoint.rstrip("/") + "/search"
@@ -543,6 +550,56 @@ class WebSearchClient:
             engine_name="神马",
         )
 
+    @staticmethod
+    def _parse_google(content: str) -> list[SearchResult]:
+        document = _parse_html(content, "Google")
+        lowered = content.lower()
+        if (
+            document.xpath(
+                "//a[contains(@href, '/httpservice/retry/enablejs')] "
+                "| //form[contains(@action, '/sorry/')]"
+            )
+            or "unusual traffic" in lowered
+            or "我们的系统检测到" in content
+        ):
+            raise SearchHumanVerificationRequired(
+                "Google 要求人机验证；请检查桌面代理后重试"
+            )
+        rows = []
+        for heading in document.xpath("//*[@id='search']//a[@href]//h3"):
+            links = heading.xpath("ancestor::a[@href][1]")
+            if not links:
+                continue
+            link = links[0]
+            containers = heading.xpath(
+                "ancestor::div[.//*[@data-sncf or contains(concat(' ', "
+                "normalize-space(@class), ' '), ' VwiC3b ')]][1]"
+            )
+            snippets = (
+                containers[0].xpath(
+                    ".//*[@data-sncf or contains(concat(' ', normalize-space(@class), "
+                    "' '), ' VwiC3b ')]"
+                )
+                if containers
+                else []
+            )
+            rows.append(
+                (
+                    heading.text_content(),
+                    _unwrap_google_url(str(link.get("href") or "")),
+                    snippets[0].text_content() if snippets else "",
+                )
+            )
+        return _require_results_or_empty(
+            document,
+            _normalize_results(rows),
+            no_result_xpath=(
+                "//*[contains(text(), '找不到和您的查询相符的内容') "
+                "or contains(text(), 'did not match any documents')]"
+            ),
+            engine_name="Google",
+        )
+
 
 def _parse_html(content: str, engine_name: str):
     try:
@@ -604,6 +661,15 @@ def _unwrap_bing_url(value: str) -> str:
     if target_url.scheme not in {"http", "https"} or not target_url.netloc:
         return value
     return target
+
+
+def _unwrap_google_url(value: str) -> str:
+    parsed = urlparse(urljoin(GOOGLE_ENDPOINT, value))
+    if _host_matches(parsed, "google.com") or _host_matches(parsed, "google.com.hk"):
+        if parsed.path == "/url":
+            query = parse_qs(parsed.query)
+            return query.get("q", query.get("url", [""]))[0]
+    return parsed.geturl()
 
 
 def _origin(parsed) -> tuple[str, str, int | None]:

@@ -18,6 +18,7 @@ from ai_assistant.web_search import (
     BING_ENDPOINT,
     BUILTIN_ENGINES,
     DUCKDUCKGO_ENDPOINT,
+    GOOGLE_ENDPOINT,
     SEARCH_ENGINES,
     SHENMA_ENDPOINT,
     SO360_ENDPOINT,
@@ -642,6 +643,77 @@ class WebSearchTest(unittest.TestCase):
                 else:
                     with self.assertRaises(exception_type):
                         client.search("x", engine="shenma")
+
+    def test_google_enablejs_is_verification_not_empty_results(self):
+        response = FakeResponse(
+            text=(FIXTURE_DIR / "google_enablejs.html").read_text(encoding="utf-8"),
+            url=f"{GOOGLE_ENDPOINT}?q=xjtu",
+        )
+        with self.assertRaisesRegex(SearchHumanVerificationRequired, "Google 要求人机验证"):
+            WebSearchClient(FakeSession(get_response=response)).search(
+                "xjtu", engine="google"
+            )
+        self.assertTrue(response.closed)
+
+    def test_google_parser_accepts_standard_structure_without_live_fixture_claim(self):
+        content = """
+            <div id="search"><div class="result-contract">
+              <a href="https://www.xjtu.edu.cn/"><h3>西安交通大学</h3></a>
+              <div data-sncf="1">教育部直属重点大学。</div>
+            </div></div>
+        """
+        self.assertEqual(
+            WebSearchClient._parse_google(content),
+            [
+                SearchResult(
+                    "西安交通大学",
+                    "https://www.xjtu.edu.cn/",
+                    "教育部直属重点大学。",
+                )
+            ],
+        )
+
+    def test_google_fixed_endpoint_uses_system_network_without_proxy_parameters(self):
+        content = """
+            <div id="search"><div>
+              <a href="/url?q=https%3A%2F%2Fwww.xjtu.edu.cn%2F"><h3>西安交通大学</h3></a>
+              <div class="VwiC3b">XJTU</div>
+            </div></div>
+        """
+        response = FakeResponse(text=content, url=f"{GOOGLE_ENDPOINT}?q=xjtu")
+        session = FakeSession(get_response=response)
+
+        results = WebSearchClient(session).search("xjtu", engine="google", limit=3)
+
+        self.assertEqual(results[0].url, "https://www.xjtu.edu.cn/")
+        method, endpoint, kwargs = session.calls[0]
+        self.assertEqual((method, endpoint), ("GET", GOOGLE_ENDPOINT))
+        self.assertEqual(kwargs["params"], {"q": "xjtu"})
+        self.assertNotIn("proxies", kwargs)
+        self.assertFalse(kwargs["allow_redirects"])
+
+    def test_google_distinguishes_empty_unknown_and_unsafe_results(self):
+        empty = FakeResponse(
+            text="<div>找不到和您的查询相符的内容</div>",
+            url=GOOGLE_ENDPOINT,
+        )
+        self.assertEqual(
+            WebSearchClient(FakeSession(get_response=empty)).search(
+                "x", engine="google"
+            ),
+            [],
+        )
+
+        for content in (
+            "<div>changed layout</div>",
+            '<div id="search"><div><a href="javascript:alert(1)"><h3>Unsafe</h3></a></div></div>',
+        ):
+            with self.subTest(content=content):
+                response = FakeResponse(text=content, url=GOOGLE_ENDPOINT)
+                with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
+                    WebSearchClient(FakeSession(get_response=response)).search(
+                        "x", engine="google"
+                    )
 
     def test_duckduckgo_human_challenge_is_not_misreported_as_empty_results(self):
         challenged = FakeResponse(
