@@ -285,7 +285,13 @@ class WebSearchClient:
             payload = json.loads(content)
         except (TypeError, ValueError, UnicodeDecodeError) as error:
             raise RuntimeError("SearXNG 返回了无效 JSON") from error
-        rows = payload.get("results", []) if isinstance(payload, dict) else []
+        if (
+            not isinstance(payload, dict)
+            or "results" not in payload
+            or not isinstance(payload["results"], list)
+        ):
+            raise RuntimeError("SearXNG 返回了无效 JSON")
+        rows = payload["results"]
         return _normalize_results(
             (row.get("title"), row.get("url"), row.get("content"))
             for row in rows
@@ -519,7 +525,9 @@ class WebSearchClient:
                     snippets[0].text_content() if snippets else "",
                 )
             )
-        for node in document.xpath("//script[@type='application/json']/text()"):
+        for node in document.xpath(
+            "//script[@type='application/json' and @data-used-by='hydrate']/text()"
+        ):
             try:
                 payload = json.loads(node)
             except (TypeError, ValueError):
@@ -649,15 +657,15 @@ def _unwrap_bing_url(value: str) -> str:
     if encoded.startswith("a1"):
         encoded = encoded[2:]
     if not encoded:
-        return value
+        return ""
     try:
         padding = "=" * (-len(encoded) % 4)
         target = urlsafe_b64decode(encoded + padding).decode("utf-8")
     except (BinasciiError, UnicodeDecodeError, ValueError):
-        return value
+        return ""
     target_url = urlparse(target)
     if target_url.scheme not in {"http", "https"} or not target_url.netloc:
-        return value
+        return ""
     return target
 
 

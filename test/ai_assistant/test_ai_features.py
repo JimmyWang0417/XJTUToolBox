@@ -157,13 +157,15 @@ class IndependentProtocolConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             profiles = [
-                replace(AIProfile.default(), id="auto", search_engine="auto"),
                 replace(
                     AIProfile.default(),
-                    id="bing",
-                    search_engine="bing",
+                    id=engine,
+                    search_engine=engine,
                     search_endpoint="https://ignored.example",
-                ),
+                )
+                for engine, _label in SEARCH_ENGINES
+                if engine != "searxng"
+            ] + [
                 replace(
                     AIProfile.default(),
                     id="searxng",
@@ -176,8 +178,10 @@ class IndependentProtocolConfigTest(unittest.TestCase):
 
             loaded = {one.id: one for one in store.load_profiles()}
 
-        self.assertEqual(loaded["auto"].search_endpoint, "")
-        self.assertEqual(loaded["bing"].search_endpoint, "")
+        for engine, _label in SEARCH_ENGINES:
+            self.assertEqual(loaded[engine].search_engine, engine)
+            if engine != "searxng":
+                self.assertEqual(loaded[engine].search_endpoint, "")
         self.assertEqual(loaded["searxng"].search_endpoint, "https://search.example/")
 
     def test_retired_deepseek_models_are_migrated_and_blocked(self):
@@ -290,6 +294,44 @@ class WebSearchTest(unittest.TestCase):
         self.assertTrue(session.calls[0][2]["stream"])
         self.assertTrue(response.closed)
 
+    def test_query_limit_and_searxng_payload_bounds_are_explicit(self):
+        client = WebSearchClient(FakeSession())
+        for query in ("", "   ", "x" * 501):
+            with self.subTest(query_length=len(query)), self.assertRaisesRegex(
+                ValueError, "1–500"
+            ):
+                client.search(query, engine="bing")
+        for limit in (0, 11):
+            with self.subTest(limit=limit), self.assertRaisesRegex(ValueError, "1–10"):
+                client.search("x", engine="bing", limit=limit)
+
+        explicit_empty = FakeResponse(
+            {"results": []},
+            url="https://search.example/search?q=x&format=json",
+        )
+        self.assertEqual(
+            WebSearchClient(FakeSession(get_response=explicit_empty)).search(
+                "x", engine="searxng", endpoint="https://search.example"
+            ),
+            [],
+        )
+        invalid_responses = (
+            FakeResponse({}, url="https://search.example/search?q=x&format=json"),
+            FakeResponse(
+                {"results": {}},
+                url="https://search.example/search?q=x&format=json",
+            ),
+            FakeResponse(text="[]", url="https://search.example/search?q=x&format=json"),
+            FakeResponse(text="{", url="https://search.example/search?q=x&format=json"),
+        )
+        for response in invalid_responses:
+            with self.subTest(content=response.content), self.assertRaisesRegex(
+                RuntimeError, "无效 JSON"
+            ):
+                WebSearchClient(
+                    FakeSession(get_response=response)
+                ).search("x", engine="searxng", endpoint="https://search.example")
+
     def test_rejects_credentials_insecure_remote_and_cross_host_redirect(self):
         invalid = [
             "http://remote.example/search",
@@ -304,6 +346,7 @@ class WebSearchTest(unittest.TestCase):
             WebSearchClient(FakeSession(get_response=response)).search(
                 "x", engine="searxng", endpoint="https://search.example"
             )
+        self.assertTrue(response.closed)
 
     def test_timeout_redirect_and_oversized_stream_are_safe(self):
         with self.assertRaisesRegex(RuntimeError, "超时"):
@@ -315,6 +358,13 @@ class WebSearchTest(unittest.TestCase):
             WebSearchClient(FakeSession(get_response=redirect)).search(
                 "x", engine="searxng", endpoint="https://search.example"
             )
+        self.assertTrue(redirect.closed)
+        failure = FakeResponse({}, status=503, url="https://search.example/search")
+        with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+            WebSearchClient(FakeSession(get_response=failure)).search(
+                "x", engine="searxng", endpoint="https://search.example"
+            )
+        self.assertTrue(failure.closed)
         oversized = FakeResponse({}, url="https://search.example/search")
         oversized.content = b"x" * (2 * 1024 * 1024 + 1)
         with self.assertRaisesRegex(RuntimeError, "2 MiB"):
@@ -773,6 +823,40 @@ class WebSearchTest(unittest.TestCase):
 
         self.assertEqual(results[0].url, "https://www.xjtu.edu.cn/")
         self.assertEqual(len(session.calls), 1)
+
+    def test_bing_and_duckduckgo_drop_opaque_tracking_urls(self):
+        cases = (
+            (
+                "bing",
+                BING_ENDPOINT,
+                '<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?u=invalid">Opaque</a></h2></li>',
+            ),
+            (
+                "duckduckgo",
+                DUCKDUCKGO_ENDPOINT,
+                '<div class="result"><a class="result__a" href="/l/?kh=-1">Opaque</a></div>',
+            ),
+        )
+        for engine, endpoint, content in cases:
+            with self.subTest(engine=engine):
+                response = FakeResponse(text=content, url=endpoint)
+                with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
+                    WebSearchClient(FakeSession(get_response=response)).search(
+                        "x", engine=engine
+                    )
+
+    def test_shenma_ignores_unscoped_application_json(self):
+        content = """
+            <script type="application/json">
+              {"titleProps":{"content":"Unrelated","dest_url":"https://source.test/"}}
+            </script>
+        """
+        with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
+            WebSearchClient(
+                FakeSession(
+                    get_response=FakeResponse(text=content, url=SHENMA_ENDPOINT)
+                )
+            ).search("x", engine="shenma")
 
     def test_auto_search_returns_bing_without_second_request(self):
         bing = FakeResponse(
