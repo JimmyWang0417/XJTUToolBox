@@ -19,6 +19,8 @@ from ai_assistant.web_search import (
     BUILTIN_ENGINES,
     DUCKDUCKGO_ENDPOINT,
     SEARCH_ENGINES,
+    SO360_ENDPOINT,
+    SOGOU_ENDPOINT,
     SearchHumanVerificationRequired,
     SearchResult,
     WebSearchClient,
@@ -477,6 +479,95 @@ class WebSearchTest(unittest.TestCase):
                     with self.assertRaisesRegex(exception_type, message):
                         client.search("x", engine="baidu")
                 self.assertTrue(response.closed)
+
+    def test_so360_uses_data_mdurl_without_requesting_tracking_link(self):
+        response = FakeResponse(
+            text=(FIXTURE_DIR / "so360_organic_result.html").read_text(encoding="utf-8"),
+            url=f"{SO360_ENDPOINT}?q=xjtu",
+        )
+        session = FakeSession(get_response=response)
+
+        results = WebSearchClient(session).search("xjtu", engine="so360", limit=3)
+
+        self.assertEqual(
+            results,
+            [
+                SearchResult(
+                    "西安交通大学新闻网",
+                    "http://news.xjtu.edu.cn/",
+                    "西安交通大学新闻门户。",
+                )
+            ],
+        )
+        self.assertEqual([call[1] for call in session.calls], [SO360_ENDPOINT])
+        self.assertEqual(session.calls[0][2]["params"], {"q": "xjtu"})
+
+    def test_sogou_decodes_url_parameter_without_requesting_tracking_link(self):
+        response = FakeResponse(
+            text=(FIXTURE_DIR / "sogou_organic_result.html").read_text(encoding="utf-8"),
+            url=f"{SOGOU_ENDPOINT}?keyword=xjtu",
+        )
+        session = FakeSession(get_response=response)
+
+        results = WebSearchClient(session).search("xjtu", engine="sogou", limit=3)
+
+        self.assertEqual(
+            results,
+            [
+                SearchResult(
+                    "Welcome to Xi'an Jiaotong University!",
+                    "http://men.xjtu.edu.cn/",
+                    "XJTU teaching and research news.",
+                )
+            ],
+        )
+        self.assertEqual([call[1] for call in session.calls], [SOGOU_ENDPOINT])
+        self.assertEqual(session.calls[0][2]["params"], {"keyword": "xjtu"})
+
+    def test_so360_and_sogou_drop_opaque_or_unsafe_tracking_targets(self):
+        cases = (
+            (
+                "so360",
+                SO360_ENDPOINT,
+                '<li class="res-list"><h3><a href="https://www.so.com/link?m=opaque">Opaque</a></h3></li>',
+            ),
+            (
+                "so360",
+                SO360_ENDPOINT,
+                '<li class="res-list"><h3><a href="https://www.so.com/link?m=x" data-mdurl="javascript:alert(1)">Unsafe</a></h3></li>',
+            ),
+            (
+                "sogou",
+                SOGOU_ENDPOINT,
+                '<div class="vrResult"><h3><a class="resultLink" href="./tc?url=https%3A%2F%2Fuser%3Asecret%40source.test%2F">Unsafe</a></h3></div>',
+            ),
+        )
+        for engine, endpoint, content in cases:
+            with self.subTest(engine=engine, content=content):
+                response = FakeResponse(text=content, url=endpoint)
+                with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
+                    WebSearchClient(FakeSession(get_response=response)).search(
+                        "x", engine=engine
+                    )
+
+    def test_so360_and_sogou_distinguish_challenge_empty_and_unknown_structure(self):
+        cases = (
+            ("so360", SO360_ENDPOINT, '<div id="verify">captcha</div>', SearchHumanVerificationRequired),
+            ("so360", SO360_ENDPOINT, '<div class="no-result">没有找到相关结果</div>', None),
+            ("so360", SO360_ENDPOINT, '<div>changed layout</div>', RuntimeError),
+            ("sogou", SOGOU_ENDPOINT, '<div class="verify">captcha</div>', SearchHumanVerificationRequired),
+            ("sogou", SOGOU_ENDPOINT, '<div class="no-result">未找到相关结果</div>', None),
+            ("sogou", SOGOU_ENDPOINT, '<div>changed layout</div>', RuntimeError),
+        )
+        for engine, endpoint, content, exception_type in cases:
+            with self.subTest(engine=engine, exception=exception_type):
+                response = FakeResponse(text=content, url=endpoint)
+                client = WebSearchClient(FakeSession(get_response=response))
+                if exception_type is None:
+                    self.assertEqual(client.search("x", engine=engine), [])
+                else:
+                    with self.assertRaises(exception_type):
+                        client.search("x", engine=engine)
 
     def test_duckduckgo_human_challenge_is_not_misreported_as_empty_results(self):
         challenged = FakeResponse(
