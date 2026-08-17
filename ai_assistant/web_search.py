@@ -254,6 +254,9 @@ class WebSearchClient:
             )
             status = int(response.status_code)
             if 300 <= status < 400:
+                location = str(response.headers.get("Location", "")).strip()
+                if _is_human_verification_redirect(endpoint, location):
+                    raise SearchHumanVerificationRequired("百度要求人机验证")
                 raise RuntimeError("联网搜索服务返回了重定向；请直接填写最终搜索地址")
             if not 200 <= status < 300:
                 raise RuntimeError(f"联网搜索失败（HTTP {status}）")
@@ -493,6 +496,14 @@ class WebSearchClient:
 
     @staticmethod
     def _parse_shenma(content: str) -> list[SearchResult]:
+        lowered = content.lower()
+        compact = "".join(lowered.split())
+        if (
+            "_____tmd_____/punish" in lowered
+            or '"action":"captcha"' in compact
+            or "rgv587_flag" in lowered
+        ):
+            raise SearchHumanVerificationRequired("神马要求人机验证")
         document = _parse_html(content, "神马")
         if document.xpath(
             "//*[@id='verify' or @id='captcha' "
@@ -692,6 +703,17 @@ def _host_matches(parsed, domain: str) -> bool:
     host = (parsed.hostname or "").lower()
     domain = domain.lower()
     return host == domain or host.endswith(f".{domain}")
+
+
+def _is_human_verification_redirect(endpoint: str, location: str) -> bool:
+    source = urlparse(endpoint)
+    target = urlparse(urljoin(endpoint, location))
+    if not (_host_matches(source, "baidu.com") and _host_matches(target, "baidu.com")):
+        return False
+    path = target.path.lower()
+    return _host_matches(target, "wappass.baidu.com") or any(
+        marker in path for marker in ("/captcha/", "/verify/", "tuxing")
+    )
 
 
 def _walk_dicts(value):

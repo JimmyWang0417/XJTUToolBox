@@ -682,6 +682,11 @@ class WebSearchTest(unittest.TestCase):
     def test_shenma_distinguishes_challenge_empty_and_unknown_structure(self):
         cases = (
             ('<div class="captcha">captcha</div>', SearchHumanVerificationRequired),
+            (
+                (FIXTURE_DIR / "shenma_challenge.html").read_text(encoding="utf-8"),
+                SearchHumanVerificationRequired,
+            ),
+            ('<html><body><!--rgv587_flag:sm--></body></html>', SearchHumanVerificationRequired),
             ('<div class="no-result">没有找到相关结果</div>', None),
             ('<div>changed layout</div>', RuntimeError),
         )
@@ -943,6 +948,33 @@ class WebSearchTest(unittest.TestCase):
                 ),
                 FakeResponse(text="<html>changed layout</html>", url=SO360_ENDPOINT),
             ])).search("x", engine="auto", limit=3)
+
+    def test_auto_search_counts_baidu_captcha_redirect_as_challenge(self):
+        responses = [
+            FakeResponse(text='<form id="b_captcha"></form>', url=BING_ENDPOINT),
+            FakeResponse(
+                status=302,
+                url=BAIDU_ENDPOINT,
+                headers={
+                    "Location": "https://wappass.baidu.com/static/captcha/tuxing_v2.html"
+                },
+            ),
+            FakeResponse(text='<div id="verify">captcha</div>', url=SO360_ENDPOINT),
+        ]
+        with self.assertRaisesRegex(SearchAllSourcesVerificationRequired, "均要求人机验证"):
+            WebSearchClient(FakeSession(get_response=responses)).search(
+                "x", engine="auto", limit=3
+            )
+
+        ordinary_redirect = FakeResponse(
+            status=302,
+            url=BAIDU_ENDPOINT,
+            headers={"Location": "https://www.baidu.com/s?wd=redirected"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "重定向"):
+            WebSearchClient(FakeSession(get_response=ordinary_redirect)).search(
+                "x", engine="baidu", limit=3
+            )
 
     def test_one_challenge_and_two_empty_sources_do_not_raise_aggregate_verification(self):
         bing_challenge = FakeResponse(
