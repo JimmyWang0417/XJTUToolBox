@@ -550,14 +550,9 @@ class AIInterfaceSmokeTest(unittest.TestCase):
         widget.searchEngineCombo.setCurrentIndex(bing_index)
         self.assertTrue(widget.searchEndpointEdit.isHidden())
         self.assertFalse(widget.searchEndpointEdit.isEnabled())
-        searxng_index = widget.searchEngineCombo.findText("SearXNG（自托管）")
-        widget.searchEngineCombo.setCurrentIndex(searxng_index)
-        widget.searchEndpointEdit.setText("https://search.example")
-        self.assertFalse(widget.searchEndpointEdit.isHidden())
-        self.assertTrue(widget.searchEndpointEdit.isEnabled())
         self.assertTrue(widget.saveConfiguration())
-        self.assertEqual(widget.profile.search_engine, "searxng")
-        self.assertEqual(widget.profile.search_endpoint, "https://search.example")
+        self.assertEqual(widget.profile.search_engine, "bing")
+        self.assertEqual(widget.profile.search_endpoint, "")
 
     def test_search_catalog_labels_order_and_endpoint_visibility(self):
         widget = self.create_interfaces()
@@ -569,27 +564,18 @@ class AIInterfaceSmokeTest(unittest.TestCase):
             labels,
             [
                 "自动（直连推荐）",
-                "百度（直连）",
                 "Bing（直连）",
-                "Google（需要代理）",
                 "搜狗（直连）",
                 "360 搜索（直连）",
-                "神马（直连）",
-                "DuckDuckGo（需要代理）",
-                "SearXNG（自托管）",
             ],
         )
         widget.capabilityChecks["web_search"].setChecked(True)
-        for index in range(widget.searchEngineCombo.count() - 1):
+        for index in range(widget.searchEngineCombo.count()):
             with self.subTest(label=labels[index]):
                 widget.searchEngineCombo.setCurrentIndex(index)
                 app.processEvents()
                 self.assertTrue(widget.searchEndpointEdit.isHidden())
                 self.assertFalse(widget.searchEndpointEdit.isEnabled())
-        widget.searchEngineCombo.setCurrentIndex(widget.searchEngineCombo.count() - 1)
-        app.processEvents()
-        self.assertFalse(widget.searchEndpointEdit.isHidden())
-        self.assertTrue(widget.searchEndpointEdit.isEnabled())
 
     def test_direct_search_choice_persists_and_aggregate_verification_turns_capability_off(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -617,7 +603,7 @@ class AIInterfaceSmokeTest(unittest.TestCase):
             reloaded = AIConfigStore(path, keyring_backend=DummyKeyring()).load_profiles()[0]
             self.assertNotIn("web_search", reloaded.capability_ids)
 
-    def test_legacy_searxng_backed_engine_loads_as_self_hosted(self):
+    def test_legacy_disabled_engine_loads_as_auto_without_endpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             legacy = {
@@ -638,10 +624,11 @@ class AIInterfaceSmokeTest(unittest.TestCase):
             widget.show()
             app.processEvents()
 
-            self.assertEqual(widget._currentSearchEngine(), "searxng")
-            self.assertEqual(widget.searchEndpointEdit.text(), "https://search.example/")
-            self.assertFalse(widget.searchEndpointEdit.isHidden())
-            self.assertTrue(widget.searchEndpointEdit.isEnabled())
+            self.assertEqual(widget._currentSearchEngine(), "auto")
+            self.assertEqual(widget.searchEndpointEdit.text(), "")
+            self.assertTrue(widget.searchEndpointEdit.isHidden())
+            self.assertFalse(widget.searchEndpointEdit.isEnabled())
+            self.assertTrue(widget.capabilityChecks["web_search"].isChecked())
 
     def test_request_thread_disables_search_only_after_aggregate_verification_failure(self):
         class CapturingAIClient:

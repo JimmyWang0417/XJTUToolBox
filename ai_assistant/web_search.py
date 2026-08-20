@@ -21,17 +21,17 @@ SHENMA_ENDPOINT = "https://m.sm.cn/s"
 DUCKDUCKGO_ENDPOINT = "https://html.duckduckgo.com/html/"
 SEARCH_ENGINES = (
     ("auto", "自动（直连推荐）"),
-    ("baidu", "百度（直连）"),
     ("bing", "Bing（直连）"),
-    ("google", "Google（需要代理）"),
     ("sogou", "搜狗（直连）"),
     ("so360", "360 搜索（直连）"),
-    ("shenma", "神马（直连）"),
-    ("duckduckgo", "DuckDuckGo（需要代理）"),
-    ("searxng", "SearXNG（自托管）"),
 )
-BUILTIN_ENGINES = {
-    engine for engine, _label in SEARCH_ENGINES if engine != "searxng"
+BUILTIN_ENGINES = {engine for engine, _label in SEARCH_ENGINES}
+DISABLED_SEARCH_ENGINES = {
+    "baidu",
+    "google",
+    "shenma",
+    "duckduckgo",
+    "searxng",
 }
 
 _BROWSER_HEADERS = {
@@ -61,10 +61,14 @@ class SearchResult:
 
 def validate_search_settings(engine: str, endpoint: str = "") -> tuple[str, str]:
     engine = str(engine).strip().lower()
-    if engine not in {one[0] for one in SEARCH_ENGINES}:
-        raise ValueError("不支持的联网搜索引擎")
     if engine in BUILTIN_ENGINES:
         return engine, ""
+    if engine in DISABLED_SEARCH_ENGINES:
+        raise ValueError("该联网搜索引擎暂不可用")
+    raise ValueError("不支持的联网搜索引擎")
+
+
+def _validate_searxng_endpoint(endpoint: str) -> str:
     endpoint = str(endpoint).strip()
     parsed = urlparse(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -73,7 +77,7 @@ def validate_search_settings(engine: str, endpoint: str = "") -> tuple[str, str]
         raise ValueError("搜索地址不得包含凭据、查询参数或片段")
     if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("非本机搜索服务必须使用 HTTPS")
-    return engine, endpoint.rstrip("/") + ("/" if parsed.path in {"", "/"} else "")
+    return endpoint.rstrip("/") + ("/" if parsed.path in {"", "/"} else "")
 
 
 class WebSearchClient:
@@ -101,7 +105,7 @@ class WebSearchClient:
 
     def _search_auto(self, query: str, limit: int) -> list[SearchResult]:
         challenges = 0
-        for engine in ("bing", "baidu", "so360"):
+        for engine in ("bing", "sogou", "so360"):
             try:
                 results = self._search_one(query, engine, "", limit)
             except SearchHumanVerificationRequired:
@@ -175,6 +179,7 @@ class WebSearchClient:
             )
             results = self._parse_google(content.decode(encoding, errors="replace"))
         else:
+            endpoint = _validate_searxng_endpoint(endpoint)
             if not endpoint.rstrip("/").endswith("/search"):
                 endpoint = endpoint.rstrip("/") + "/search"
             content, _encoding = self._fetch(
@@ -253,6 +258,11 @@ class WebSearchClient:
                 stream=True,
             )
             status = int(response.status_code)
+            if (
+                endpoint == SHENMA_ENDPOINT
+                and str(response.headers.get("bxpunish", "")).strip() not in {"", "0"}
+            ):
+                raise SearchHumanVerificationRequired("神马要求人机验证")
             if 300 <= status < 400:
                 location = str(response.headers.get("Location", "")).strip()
                 if _is_human_verification_redirect(endpoint, location):

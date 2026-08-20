@@ -126,34 +126,71 @@ class IndependentProtocolConfigTest(unittest.TestCase):
             store.save_profiles([loaded])
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], SCHEMA_VERSION)
 
-    def test_v2_search_engines_migrate_without_changing_network_route(self):
+    def test_legacy_search_engines_migrate_to_available_sources(self):
         with tempfile.TemporaryDirectory() as directory:
-            for legacy_engine, expected_engine, expected_endpoint in (
-                ("duckduckgo", "duckduckgo", ""),
-                ("bing", "searxng", "https://search.example/"),
-                ("baidu", "searxng", "https://search.example/"),
-                ("google", "searxng", "https://search.example/"),
-                ("searxng", "searxng", "https://search.example/"),
-            ):
-                with self.subTest(engine=legacy_engine):
-                    path = Path(directory) / f"{legacy_engine}.json"
+            for version in (2, 3):
+                for legacy_engine in (
+                    "baidu",
+                    "google",
+                    "shenma",
+                    "duckduckgo",
+                    "searxng",
+                ):
+                    with self.subTest(version=version, engine=legacy_engine):
+                        path = Path(directory) / f"v{version}-{legacy_engine}.json"
+                        legacy = replace(
+                            AIProfile.default(),
+                            id=f"v{version}-{legacy_engine}",
+                            name="保留的用户配置",
+                            search_engine=legacy_engine,
+                            search_endpoint="https://search.example/",
+                            search_result_limit=8,
+                        )
+                        path.write_text(
+                            json.dumps({"version": version, "profiles": [legacy.__dict__]}),
+                            encoding="utf-8",
+                        )
+
+                        store = AIConfigStore(path, keyring_backend=object())
+                        loaded = store.load_profiles()[0]
+
+                        self.assertEqual(loaded.id, legacy.id)
+                        self.assertEqual(loaded.name, "保留的用户配置")
+                        self.assertEqual(loaded.search_engine, "auto")
+                        self.assertEqual(loaded.search_endpoint, "")
+                        self.assertEqual(loaded.search_result_limit, 8)
+                        self.assertEqual(store.last_error, "")
+
+    def test_v3_available_search_engines_keep_user_preferences(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for engine in ("auto", "bing", "sogou", "so360"):
+                with self.subTest(engine=engine):
+                    path = Path(directory) / f"v3-{engine}.json"
                     legacy = replace(
                         AIProfile.default(),
-                        search_engine=legacy_engine,
-                        search_endpoint="https://search.example/",
+                        id=f"v3-{engine}",
+                        name="保留的用户配置",
+                        search_engine=engine,
+                        search_endpoint="https://ignored.example/",
+                        search_result_limit=8,
                     )
                     path.write_text(
-                        json.dumps({"version": 2, "profiles": [legacy.__dict__]}),
+                        json.dumps({"version": 3, "profiles": [legacy.__dict__]}),
                         encoding="utf-8",
                     )
 
-                    loaded = AIConfigStore(path, keyring_backend=object()).load_profiles()[0]
+                    store = AIConfigStore(path, keyring_backend=object())
+                    loaded = store.load_profiles()[0]
 
-                    self.assertEqual(loaded.search_engine, expected_engine)
-                    self.assertEqual(loaded.search_endpoint, expected_endpoint)
+                    self.assertEqual(loaded.id, legacy.id)
+                    self.assertEqual(loaded.name, "保留的用户配置")
+                    self.assertEqual(loaded.search_engine, engine)
+                    self.assertEqual(loaded.search_endpoint, "")
+                    self.assertEqual(loaded.search_result_limit, 8)
+                    self.assertEqual(store.last_error, "")
 
-    def test_current_search_profiles_round_trip_builtin_and_self_hosted_modes(self):
-        self.assertEqual(SCHEMA_VERSION, 3)
+    def test_current_search_profiles_round_trip_available_modes(self):
+        self.assertEqual(SCHEMA_VERSION, 4)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             profiles = [
@@ -164,14 +201,6 @@ class IndependentProtocolConfigTest(unittest.TestCase):
                     search_endpoint="https://ignored.example",
                 )
                 for engine, _label in SEARCH_ENGINES
-                if engine != "searxng"
-            ] + [
-                replace(
-                    AIProfile.default(),
-                    id="searxng",
-                    search_engine="searxng",
-                    search_endpoint="https://search.example",
-                ),
             ]
             store = AIConfigStore(path, keyring_backend=object())
             store.save_profiles(profiles)
@@ -180,9 +209,7 @@ class IndependentProtocolConfigTest(unittest.TestCase):
 
         for engine, _label in SEARCH_ENGINES:
             self.assertEqual(loaded[engine].search_engine, engine)
-            if engine != "searxng":
-                self.assertEqual(loaded[engine].search_endpoint, "")
-        self.assertEqual(loaded["searxng"].search_endpoint, "https://search.example/")
+            self.assertEqual(loaded[engine].search_endpoint, "")
 
     def test_retired_deepseek_models_are_migrated_and_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -251,30 +278,49 @@ class ModelCatalogTest(unittest.TestCase):
 
 
 class WebSearchTest(unittest.TestCase):
+    @staticmethod
+    def retained_adapter_search(
+        session,
+        query="x",
+        *,
+        engine,
+        endpoint="",
+        limit=5,
+    ):
+        """Exercise retained adapters without reopening their public entry points."""
+
+        return WebSearchClient(session)._search_one(query, engine, endpoint, limit)
+
     def test_search_catalog_has_approved_ids_labels_and_builtin_boundary(self):
         self.assertEqual(
             SEARCH_ENGINES,
             (
                 ("auto", "自动（直连推荐）"),
-                ("baidu", "百度（直连）"),
                 ("bing", "Bing（直连）"),
-                ("google", "Google（需要代理）"),
                 ("sogou", "搜狗（直连）"),
                 ("so360", "360 搜索（直连）"),
-                ("shenma", "神马（直连）"),
-                ("duckduckgo", "DuckDuckGo（需要代理）"),
-                ("searxng", "SearXNG（自托管）"),
             ),
         )
-        self.assertEqual(
-            BUILTIN_ENGINES,
-            {"auto", "baidu", "bing", "google", "sogou", "so360", "shenma", "duckduckgo"},
-        )
-        for engine, _label in SEARCH_ENGINES[:-1]:
+        self.assertEqual(BUILTIN_ENGINES, {"auto", "bing", "sogou", "so360"})
+        for engine, _label in SEARCH_ENGINES:
             self.assertEqual(
                 validate_search_settings(engine, "https://ignored.example"),
                 (engine, ""),
             )
+
+    def test_disabled_search_sources_are_rejected_before_network_access(self):
+        disabled = ("baidu", "google", "shenma", "duckduckgo", "searxng")
+        for engine in disabled:
+            session = FakeSession()
+            with self.subTest(engine=engine), self.assertRaisesRegex(
+                ValueError, "暂不可用"
+            ):
+                WebSearchClient(session).search(
+                    "x",
+                    engine=engine,
+                    endpoint="https://search.example",
+                )
+            self.assertEqual(session.calls, [])
 
     def test_custom_searxng_is_bounded_and_parsed(self):
         response = FakeResponse(
@@ -285,8 +331,10 @@ class WebSearchTest(unittest.TestCase):
             url="https://search.example/search?q=x&format=json",
         )
         session = FakeSession(get_response=response)
-        results = WebSearchClient(session).search(
-            "x", engine="searxng", endpoint="https://search.example", limit=5
+        results = self.retained_adapter_search(
+            session,
+            engine="searxng",
+            endpoint="https://search.example",
         )
         self.assertEqual([(one.title, one.url) for one in results], [("Result", "https://source.test/a")])
         self.assertEqual(session.calls[0][1], "https://search.example/search")
@@ -310,8 +358,10 @@ class WebSearchTest(unittest.TestCase):
             url="https://search.example/search?q=x&format=json",
         )
         self.assertEqual(
-            WebSearchClient(FakeSession(get_response=explicit_empty)).search(
-                "x", engine="searxng", endpoint="https://search.example"
+            self.retained_adapter_search(
+                FakeSession(get_response=explicit_empty),
+                engine="searxng",
+                endpoint="https://search.example",
             ),
             [],
         )
@@ -328,9 +378,11 @@ class WebSearchTest(unittest.TestCase):
             with self.subTest(content=response.content), self.assertRaisesRegex(
                 RuntimeError, "无效 JSON"
             ):
-                WebSearchClient(
-                    FakeSession(get_response=response)
-                ).search("x", engine="searxng", endpoint="https://search.example")
+                self.retained_adapter_search(
+                    FakeSession(get_response=response),
+                    engine="searxng",
+                    endpoint="https://search.example",
+                )
 
     def test_rejects_credentials_insecure_remote_and_cross_host_redirect(self):
         invalid = [
@@ -340,36 +392,50 @@ class WebSearchTest(unittest.TestCase):
         ]
         for endpoint in invalid:
             with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
-                validate_search_settings("searxng", endpoint)
+                self.retained_adapter_search(
+                    FakeSession(),
+                    engine="searxng",
+                    endpoint=endpoint,
+                )
         response = FakeResponse({"results": []}, url="https://evil.example/search")
         with self.assertRaisesRegex(RuntimeError, "未配置"):
-            WebSearchClient(FakeSession(get_response=response)).search(
-                "x", engine="searxng", endpoint="https://search.example"
+            self.retained_adapter_search(
+                FakeSession(get_response=response),
+                engine="searxng",
+                endpoint="https://search.example",
             )
         self.assertTrue(response.closed)
 
     def test_timeout_redirect_and_oversized_stream_are_safe(self):
         with self.assertRaisesRegex(RuntimeError, "超时"):
-            WebSearchClient(FakeSession(get_response=requests.Timeout())).search(
-                "x", engine="searxng", endpoint="https://search.example"
+            self.retained_adapter_search(
+                FakeSession(get_response=requests.Timeout()),
+                engine="searxng",
+                endpoint="https://search.example",
             )
         redirect = FakeResponse({}, status=302, url="https://search.example/search")
         with self.assertRaisesRegex(RuntimeError, "重定向"):
-            WebSearchClient(FakeSession(get_response=redirect)).search(
-                "x", engine="searxng", endpoint="https://search.example"
+            self.retained_adapter_search(
+                FakeSession(get_response=redirect),
+                engine="searxng",
+                endpoint="https://search.example",
             )
         self.assertTrue(redirect.closed)
         failure = FakeResponse({}, status=503, url="https://search.example/search")
         with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
-            WebSearchClient(FakeSession(get_response=failure)).search(
-                "x", engine="searxng", endpoint="https://search.example"
+            self.retained_adapter_search(
+                FakeSession(get_response=failure),
+                engine="searxng",
+                endpoint="https://search.example",
             )
         self.assertTrue(failure.closed)
         oversized = FakeResponse({}, url="https://search.example/search")
         oversized.content = b"x" * (2 * 1024 * 1024 + 1)
         with self.assertRaisesRegex(RuntimeError, "2 MiB"):
-            WebSearchClient(FakeSession(get_response=oversized)).search(
-                "x", engine="searxng", endpoint="https://search.example"
+            self.retained_adapter_search(
+                FakeSession(get_response=oversized),
+                engine="searxng",
+                endpoint="https://search.example",
             )
         self.assertTrue(oversized.closed)
 
@@ -404,8 +470,9 @@ class WebSearchTest(unittest.TestCase):
             with self.subTest(engine=engine):
                 response = FakeResponse(text=content, url=endpoint)
                 self.assertEqual(
-                    WebSearchClient(FakeSession(get_response=response)).search(
-                        "x", engine=engine
+                    self.retained_adapter_search(
+                        FakeSession(get_response=response),
+                        engine=engine,
                     ),
                     [],
                 )
@@ -421,8 +488,9 @@ class WebSearchTest(unittest.TestCase):
                     url=endpoint,
                 )
                 with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
-                    WebSearchClient(FakeSession(get_response=response)).search(
-                        "x", engine=engine
+                    self.retained_adapter_search(
+                        FakeSession(get_response=response),
+                        engine=engine,
                     )
                 self.assertTrue(response.closed)
 
@@ -438,7 +506,9 @@ class WebSearchTest(unittest.TestCase):
         )
         session = FakeSession(get_response=page, head_response=resolved)
 
-        results = WebSearchClient(session).search("xjtu", engine="baidu", limit=1)
+        results = self.retained_adapter_search(
+            session, "xjtu", engine="baidu", limit=1
+        )
 
         self.assertEqual(
             results,
@@ -473,7 +543,7 @@ class WebSearchTest(unittest.TestCase):
         )
         session = FakeSession(get_response=page, head_response=attacker_response)
 
-        results = WebSearchClient(session).search("x", engine="baidu", limit=1)
+        results = self.retained_adapter_search(session, engine="baidu", limit=1)
 
         self.assertEqual(
             results,
@@ -518,7 +588,7 @@ class WebSearchTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            WebSearchClient(session).search("x", engine="baidu", limit=5),
+            self.retained_adapter_search(session, engine="baidu", limit=5),
             [],
         )
         self.assertEqual(
@@ -549,12 +619,15 @@ class WebSearchTest(unittest.TestCase):
         for content, exception_type, message in cases:
             with self.subTest(message=message or "empty"):
                 response = FakeResponse(text=content, url=BAIDU_ENDPOINT)
-                client = WebSearchClient(FakeSession(get_response=response))
+                session = FakeSession(get_response=response)
                 if exception_type is None:
-                    self.assertEqual(client.search("x", engine="baidu"), [])
+                    self.assertEqual(
+                        self.retained_adapter_search(session, engine="baidu"),
+                        [],
+                    )
                 else:
                     with self.assertRaisesRegex(exception_type, message):
-                        client.search("x", engine="baidu")
+                        self.retained_adapter_search(session, engine="baidu")
                 self.assertTrue(response.closed)
 
     def test_so360_uses_data_mdurl_without_requesting_tracking_link(self):
@@ -653,7 +726,9 @@ class WebSearchTest(unittest.TestCase):
         )
         session = FakeSession(get_response=response)
 
-        results = WebSearchClient(session).search("xjtu", engine="shenma", limit=5)
+        results = self.retained_adapter_search(
+            session, "xjtu", engine="shenma", limit=5
+        )
 
         self.assertEqual(
             results,
@@ -685,8 +760,9 @@ class WebSearchTest(unittest.TestCase):
         """
         response = FakeResponse(text=malformed_with_html, url=SHENMA_ENDPOINT)
         self.assertEqual(
-            WebSearchClient(FakeSession(get_response=response)).search(
-                "x", engine="shenma"
+            self.retained_adapter_search(
+                FakeSession(get_response=response),
+                engine="shenma",
             ),
             [SearchResult("Safe HTML", "https://safe.test/", "Snippet")],
         )
@@ -699,9 +775,12 @@ class WebSearchTest(unittest.TestCase):
             </script>
         """
         with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
-            WebSearchClient(
-                FakeSession(get_response=FakeResponse(text=unsafe, url=SHENMA_ENDPOINT))
-            ).search("x", engine="shenma")
+            self.retained_adapter_search(
+                FakeSession(
+                    get_response=FakeResponse(text=unsafe, url=SHENMA_ENDPOINT)
+                ),
+                engine="shenma",
+            )
 
     def test_shenma_distinguishes_challenge_empty_and_unknown_structure(self):
         cases = (
@@ -717,12 +796,34 @@ class WebSearchTest(unittest.TestCase):
         for content, exception_type in cases:
             with self.subTest(exception=exception_type):
                 response = FakeResponse(text=content, url=SHENMA_ENDPOINT)
-                client = WebSearchClient(FakeSession(get_response=response))
+                session = FakeSession(get_response=response)
                 if exception_type is None:
-                    self.assertEqual(client.search("x", engine="shenma"), [])
+                    self.assertEqual(
+                        self.retained_adapter_search(session, engine="shenma"),
+                        [],
+                    )
                 else:
                     with self.assertRaises(exception_type):
-                        client.search("x", engine="shenma")
+                        self.retained_adapter_search(session, engine="shenma")
+
+    def test_shenma_bxpunish_header_is_verification_before_body_parsing(self):
+        punished = FakeResponse(
+            text="<html><body>opaque punishment response</body></html>",
+            url=SHENMA_ENDPOINT,
+            headers={"bxpunish": "1"},
+        )
+
+        with self.assertRaisesRegex(
+            SearchHumanVerificationRequired,
+            "神马要求人机验证",
+        ):
+            WebSearchClient(FakeSession(get_response=punished))._fetch(
+                SHENMA_ENDPOINT,
+                params={"q": "x"},
+                accept="text/html",
+            )
+
+        self.assertTrue(punished.closed)
 
     def test_google_enablejs_is_verification_not_empty_results(self):
         response = FakeResponse(
@@ -730,8 +831,10 @@ class WebSearchTest(unittest.TestCase):
             url=f"{GOOGLE_ENDPOINT}?q=xjtu",
         )
         with self.assertRaisesRegex(SearchHumanVerificationRequired, "Google 要求人机验证"):
-            WebSearchClient(FakeSession(get_response=response)).search(
-                "xjtu", engine="google"
+            self.retained_adapter_search(
+                FakeSession(get_response=response),
+                "xjtu",
+                engine="google",
             )
         self.assertTrue(response.closed)
 
@@ -763,7 +866,9 @@ class WebSearchTest(unittest.TestCase):
         response = FakeResponse(text=content, url=f"{GOOGLE_ENDPOINT}?q=xjtu")
         session = FakeSession(get_response=response)
 
-        results = WebSearchClient(session).search("xjtu", engine="google", limit=3)
+        results = self.retained_adapter_search(
+            session, "xjtu", engine="google", limit=3
+        )
 
         self.assertEqual(results[0].url, "https://www.xjtu.edu.cn/")
         method, endpoint, kwargs = session.calls[0]
@@ -778,8 +883,9 @@ class WebSearchTest(unittest.TestCase):
             url=GOOGLE_ENDPOINT,
         )
         self.assertEqual(
-            WebSearchClient(FakeSession(get_response=empty)).search(
-                "x", engine="google"
+            self.retained_adapter_search(
+                FakeSession(get_response=empty),
+                engine="google",
             ),
             [],
         )
@@ -791,8 +897,9 @@ class WebSearchTest(unittest.TestCase):
             with self.subTest(content=content):
                 response = FakeResponse(text=content, url=GOOGLE_ENDPOINT)
                 with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
-                    WebSearchClient(FakeSession(get_response=response)).search(
-                        "x", engine="google"
+                    self.retained_adapter_search(
+                        FakeSession(get_response=response),
+                        engine="google",
                     )
 
     def test_duckduckgo_human_challenge_is_not_misreported_as_empty_results(self):
@@ -801,8 +908,10 @@ class WebSearchTest(unittest.TestCase):
             url="https://html.duckduckgo.com/html/",
         )
         with self.assertRaisesRegex(SearchHumanVerificationRequired, "人机验证"):
-            WebSearchClient(FakeSession(get_response=challenged)).search(
-                "x", engine="duckduckgo", endpoint="https://ignored.example", limit=3
+            self.retained_adapter_search(
+                FakeSession(get_response=challenged),
+                engine="duckduckgo",
+                limit=3,
             )
         self.assertTrue(challenged.closed)
 
@@ -870,8 +979,9 @@ class WebSearchTest(unittest.TestCase):
             with self.subTest(engine=engine):
                 response = FakeResponse(text=content, url=endpoint)
                 with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
-                    WebSearchClient(FakeSession(get_response=response)).search(
-                        "x", engine=engine
+                    self.retained_adapter_search(
+                        FakeSession(get_response=response),
+                        engine=engine,
                     )
 
     def test_shenma_ignores_unscoped_application_json(self):
@@ -881,11 +991,12 @@ class WebSearchTest(unittest.TestCase):
             </script>
         """
         with self.assertRaisesRegex(RuntimeError, "页面结构无法解析"):
-            WebSearchClient(
+            self.retained_adapter_search(
                 FakeSession(
                     get_response=FakeResponse(text=content, url=SHENMA_ENDPOINT)
-                )
-            ).search("x", engine="shenma")
+                ),
+                engine="shenma",
+            )
 
     def test_auto_search_returns_bing_without_second_request(self):
         bing = FakeResponse(
@@ -899,60 +1010,55 @@ class WebSearchTest(unittest.TestCase):
         self.assertEqual([one.title for one in results], ["Xi'an Jiaotong University"])
         self.assertEqual([call[1] for call in session.calls], [BING_ENDPOINT])
 
-    def test_auto_search_falls_back_bing_baidu_so360_in_fixed_order(self):
+    def test_auto_search_falls_back_bing_sogou_so360_in_fixed_order(self):
         bing = FakeResponse(
             text='<form id="b_captcha"></form>',
             url=BING_ENDPOINT,
         )
-        baidu = FakeResponse(
-            text='<div class="op_sp_realtime_n_result">没有找到相关结果</div>',
-            url=BAIDU_ENDPOINT,
+        sogou = FakeResponse(
+            text='<div class="no-result">未找到相关结果</div>',
+            url=SOGOU_ENDPOINT,
         )
         so360 = FakeResponse(
             text=(FIXTURE_DIR / "so360_organic_result.html").read_text(encoding="utf-8"),
             url=SO360_ENDPOINT,
         )
-        session = FakeSession(get_response=[bing, baidu, so360])
+        session = FakeSession(get_response=[bing, sogou, so360])
 
         results = WebSearchClient(session).search("x", engine="auto", limit=3)
 
         self.assertEqual([one.title for one in results], ["西安交通大学新闻网"])
         self.assertEqual(
             [call[1] for call in session.calls],
-            [BING_ENDPOINT, BAIDU_ENDPOINT, SO360_ENDPOINT],
+            [BING_ENDPOINT, SOGOU_ENDPOINT, SO360_ENDPOINT],
         )
 
-    def test_auto_search_stops_after_baidu_returns_resolved_results(self):
+    def test_auto_search_stops_after_sogou_returns_results(self):
         bing = FakeResponse(
             text='<li class="b_no">没有与此相关的结果</li>',
             url=BING_ENDPOINT,
         )
-        baidu = FakeResponse(
-            text=(FIXTURE_DIR / "baidu_organic_result.html").read_text(encoding="utf-8"),
-            url=BAIDU_ENDPOINT,
+        sogou = FakeResponse(
+            text=(FIXTURE_DIR / "sogou_organic_result.html").read_text(encoding="utf-8"),
+            url=SOGOU_ENDPOINT,
         )
-        resolved = FakeResponse(
-            status=302,
-            headers={"Location": "https://www.xjtu.edu.cn/"},
-        )
-        session = FakeSession(get_response=[bing, baidu], head_response=resolved)
+        session = FakeSession(get_response=[bing, sogou])
 
         results = WebSearchClient(session).search("x", engine="auto", limit=3)
 
-        self.assertEqual([one.url for one in results], ["https://www.xjtu.edu.cn/"])
+        self.assertEqual([one.url for one in results], ["http://men.xjtu.edu.cn/"])
         self.assertEqual(
             [(call[0], call[1]) for call in session.calls],
             [
                 ("GET", BING_ENDPOINT),
-                ("GET", BAIDU_ENDPOINT),
-                ("HEAD", "https://www.baidu.com/link?url=fixture-token"),
+                ("GET", SOGOU_ENDPOINT),
             ],
         )
 
     def test_auto_search_reports_all_challenges_and_mixed_failures(self):
         challenges = [
             FakeResponse(text='<form id="b_captcha"></form>', url=BING_ENDPOINT),
-            FakeResponse(text='<div id="verify-form"></div>', url=BAIDU_ENDPOINT),
+            FakeResponse(text='<div id="verify"></div>', url=SOGOU_ENDPOINT),
             FakeResponse(text='<div id="verify"></div>', url=SO360_ENDPOINT),
         ]
         with self.assertRaisesRegex(
@@ -967,37 +1073,36 @@ class WebSearchTest(unittest.TestCase):
             WebSearchClient(FakeSession(get_response=[
                 requests.Timeout(),
                 FakeResponse(
-                    text='<div class="op_sp_realtime_n_result">没有找到相关结果</div>',
-                    url=BAIDU_ENDPOINT,
+                    text='<div class="no-result">未找到相关结果</div>',
+                    url=SOGOU_ENDPOINT,
                 ),
                 FakeResponse(text="<html>changed layout</html>", url=SO360_ENDPOINT),
             ])).search("x", engine="auto", limit=3)
 
-    def test_auto_search_counts_baidu_captcha_redirect_as_challenge(self):
-        responses = [
-            FakeResponse(text='<form id="b_captcha"></form>', url=BING_ENDPOINT),
-            FakeResponse(
-                status=302,
-                url=BAIDU_ENDPOINT,
-                headers={
-                    "Location": "https://wappass.baidu.com/static/captcha/tuxing_v2.html"
-                },
-            ),
-            FakeResponse(text='<div id="verify">captcha</div>', url=SO360_ENDPOINT),
-        ]
-        with self.assertRaisesRegex(SearchAllSourcesVerificationRequired, "均要求人机验证"):
-            WebSearchClient(FakeSession(get_response=responses)).search(
-                "x", engine="auto", limit=3
+    def test_baidu_captcha_redirect_and_ordinary_redirect_are_classified(self):
+        captcha_redirect = FakeResponse(
+            status=302,
+            url=BAIDU_ENDPOINT,
+            headers={
+                "Location": "https://wappass.baidu.com/static/captcha/tuxing_v2.html"
+            },
+        )
+        with self.assertRaisesRegex(SearchHumanVerificationRequired, "百度要求人机验证"):
+            WebSearchClient(FakeSession(get_response=captcha_redirect))._fetch(
+                BAIDU_ENDPOINT,
+                params={"wd": "x"},
+                accept="text/html",
             )
-
         ordinary_redirect = FakeResponse(
             status=302,
             url=BAIDU_ENDPOINT,
             headers={"Location": "https://www.baidu.com/s?wd=redirected"},
         )
         with self.assertRaisesRegex(RuntimeError, "重定向"):
-            WebSearchClient(FakeSession(get_response=ordinary_redirect)).search(
-                "x", engine="baidu", limit=3
+            WebSearchClient(FakeSession(get_response=ordinary_redirect))._fetch(
+                BAIDU_ENDPOINT,
+                params={"wd": "x"},
+                accept="text/html",
             )
 
     def test_one_challenge_and_two_empty_sources_do_not_raise_aggregate_verification(self):
@@ -1005,9 +1110,9 @@ class WebSearchTest(unittest.TestCase):
             text='<form id="b_captcha"></form>',
             url=BING_ENDPOINT,
         )
-        baidu_empty = FakeResponse(
-            text='<div class="op_sp_realtime_n_result">没有找到相关结果</div>',
-            url=BAIDU_ENDPOINT,
+        sogou_empty = FakeResponse(
+            text='<div class="no-result">未找到相关结果</div>',
+            url=SOGOU_ENDPOINT,
         )
         so360_empty = FakeResponse(
             text='<div class="no-result">没有找到相关结果</div>',
@@ -1017,40 +1122,35 @@ class WebSearchTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "内置联网搜索暂时不可用"):
             WebSearchClient(FakeSession(get_response=[
                 bing_challenge,
-                baidu_empty,
+                sogou_empty,
                 so360_empty,
             ])).search("x", engine="auto", limit=3)
 
-    def test_auto_request_bound_is_three_pages_plus_ten_baidu_heads(self):
+    def test_auto_request_bound_is_three_pages_without_redirect_followups(self):
         bing_empty = FakeResponse(
             text='<li class="b_no">没有与此相关的结果</li>',
             url=BING_ENDPOINT,
         )
-        links = "".join(
-            '<div class="c-container"><h3><a href="https://www.baidu.com/link?url=%d">R%d</a></h3></div>'
-            % (index, index)
-            for index in range(11)
+        sogou_empty = FakeResponse(
+            text='<div class="no-result">未找到相关结果</div>',
+            url=SOGOU_ENDPOINT,
         )
-        baidu = FakeResponse(text=links, url=BAIDU_ENDPOINT)
         so360_empty = FakeResponse(
             text='<div class="no-result">没有找到相关结果</div>',
             url=SO360_ENDPOINT,
         )
-        unsafe_redirects = [
-            FakeResponse(status=302, headers={"Location": "javascript:alert(1)"})
-            for _index in range(10)
-        ]
         session = FakeSession(
-            get_response=[bing_empty, baidu, so360_empty],
-            head_response=unsafe_redirects,
+            get_response=[bing_empty, sogou_empty, so360_empty],
         )
 
         with self.assertRaisesRegex(RuntimeError, "内置联网搜索暂时不可用"):
             WebSearchClient(session).search("x", engine="auto", limit=10)
 
-        self.assertEqual(len(session.calls), 13)
+        self.assertEqual(len(session.calls), 3)
         self.assertEqual(sum(call[0] == "GET" for call in session.calls), 3)
-        self.assertEqual(sum(call[0] == "HEAD" for call in session.calls), 10)
+        self.assertEqual(sum(call[0] == "HEAD" for call in session.calls), 0)
+        self.assertNotIn(BAIDU_ENDPOINT, [call[1] for call in session.calls])
+        self.assertNotIn(SHENMA_ENDPOINT, [call[1] for call in session.calls])
         self.assertNotIn(GOOGLE_ENDPOINT, [call[1] for call in session.calls])
         self.assertNotIn(DUCKDUCKGO_ENDPOINT, [call[1] for call in session.calls])
 

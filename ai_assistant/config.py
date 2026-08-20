@@ -27,10 +27,10 @@ from .providers import (
     preset_for,
 )
 from .capabilities import validate_capability_ids
-from .web_search import validate_search_settings
+from .web_search import DISABLED_SEARCH_ENGINES, validate_search_settings
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 KEYRING_SERVICE = "XJTUToolbox.AI"
 DEFAULT_ASSISTANT_NAME = "问舟"
 DEFAULT_SYSTEM_PROMPT = "你是仙交百宝箱中的 AI 助手问舟。请准确、坦诚地回答，不确定时明确说明。"
@@ -137,7 +137,7 @@ class AIConfigStore:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             version = payload.get("version")
-            if version not in {1, 2, SCHEMA_VERSION}:
+            if version not in {1, 2, 3, SCHEMA_VERSION}:
                 raise ValueError("不支持的 AI 配置版本")
             profiles = [
                 validate_profile(self._profile_from_payload(one, version))
@@ -229,11 +229,10 @@ class AIConfigStore:
     @classmethod
     def _profile_from_payload(cls, data: dict, version: int) -> AIProfile:
         profile = cls._migrate_legacy_branding(AIProfile(**data))
-        if version < 3:
-            if profile.search_engine == "duckduckgo":
-                profile = replace(profile, search_endpoint="")
-            elif profile.search_engine in {"bing", "baidu", "google", "searxng"}:
-                profile = replace(profile, search_engine="searxng")
+        if version < 3 and profile.search_engine != "auto":
+            profile = replace(profile, search_engine="auto", search_endpoint="")
+        elif version < 4 and profile.search_engine in DISABLED_SEARCH_ENGINES:
+            profile = replace(profile, search_engine="auto", search_endpoint="")
         return profile
 
     @staticmethod
